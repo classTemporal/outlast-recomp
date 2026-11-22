@@ -9,6 +9,10 @@
 *.bik
 *.sav
 
+# Work directory & Upstream inspection
+work/
+RecompiledFuncs/
+
 # Build & Tool outputs
 build/
 bin/
