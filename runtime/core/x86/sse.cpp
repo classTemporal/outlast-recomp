@@ -1,0 +1,654 @@
+// SSE/SSE2 floating point and MXCSR (see sse.h).
+//
+// Lanes are raw bit patterns. NaN operands are handled here with the SSE
+// rules (SDM vol. 1, "SSE and SSE2 response to NaN operands"): a single
+// NaN operand is returned quieted; with two, the first source (the
+// destination register) wins; an SNaN operand raises IE. Everything else
+// goes to SoftFloat, whose 8086 specialization already matches x86 for
+// non-NaN inputs: default NaN 0xFFC00000 / 0xFFF8000000000000, tininess
+// after rounding, 0x80000000 for out-of-range conversions.
+
+#include "x86/sse.h"
+
+extern "C" {
+#include "softfloat.h"
+}
+
+#include "runtime/log.h"
+
+namespace recomp::sse {
+namespace {
+
+// MXCSR fields.
+constexpr uint32_t kIE = 0x01, kDE = 0x02, kZE = 0x04, kOE = 0x08, kUE = 0x10,
+                   kPE = 0x20, kDAZ = 0x40, kFTZ = 0x8000;
+
+// A lane format: float or double.
+template <bool Dbl>
+struct Fmt;
+template <>
+struct Fmt<false> {
+  using U = uint32_t;
+  static constexpr U kExp = 0x7F800000u, kFrac = 0x007FFFFFu, kQuiet = 0x00400000u;
+};
+template <>
+struct Fmt<true> {
+  using U = uint64_t;
+  static constexpr U kExp = 0x7FF0000000000000ull, kFrac = 0x000FFFFFFFFFFFFFull,
+                     kQuiet = 0x0008000000000000ull;
+};
+
+template <bool D>
+bool IsNaN(typename Fmt<D>::U v) {
+  return (v & Fmt<D>::kExp) == Fmt<D>::kExp && (v & Fmt<D>::kFrac);
+}
+template <bool D>
+bool IsSNaN(typename Fmt<D>::U v) {
+  return IsNaN<D>(v) && !(v & Fmt<D>::kQuiet);
+}
+template <bool D>
+bool IsDenormal(typename Fmt<D>::U v) {
+  return !(v & Fmt<D>::kExp) && (v & Fmt<D>::kFrac);
+}
+template <bool D>
+typename Fmt<D>::U Quiet(typename Fmt<D>::U v) {
+  return v | Fmt<D>::kQuiet;
+}
+
+uint8_t RoundingMode(uint32_t mxcsr) {
+  static const uint8_t kModes[4] = {softfloat_round_near_even, softfloat_round_min,
+                                    softfloat_round_max, softfloat_round_minMag};
+  return kModes[(mxcsr >> 13) & 3];
+}
+
+uint32_t FromSf(uint_fast8_t f) {
+  uint32_t r = 0;
+  if (f & softfloat_flag_invalid) r |= kIE;
+  if (f & softfloat_flag_infinite) r |= kZE;
+  if (f & softfloat_flag_overflow) r |= kOE;
+  if (f & softfloat_flag_underflow) r |= kUE;
+  if (f & softfloat_flag_inexact) r |= kPE;
+  return r;
+}
+
+// One instruction's MXCSR bookkeeping: rounding mode in, flags out.
+struct Scope {
+  Ctx& c;
+  uint64_t va;
+  uint32_t flags = 0;
+
+  Scope(Ctx& cc, uint64_t v) : c(cc), va(v) {
+    softfloat_roundingMode = RoundingMode(c.mxcsr);
+  }
+  // DAZ: a denormal operand is the zero of its sign before anything is
+  // computed with it, and raises no DE (SDM vol. 1, 10.2.3.4). Applied to
+  // every floating-point operand first, so the rules below (NaNs,
+  // precedence of invalid and divide-by-zero) see the zero.
+  template <bool D>
+  typename Fmt<D>::U Daz(typename Fmt<D>::U v) const {
+    if (!(c.mxcsr & kDAZ) || !IsDenormal<D>(v)) return v;
+    return v & ~(Fmt<D>::kExp | Fmt<D>::kFrac);
+  }
+  // Denormal operand (one DAZ left as it is): DE.
+  template <bool D>
+  void Operand(typename Fmt<D>::U v) {
+    if (IsDenormal<D>(v)) flags |= kDE;
+  }
+  void Begin() { softfloat_exceptionFlags = 0; }
+  void End() { flags |= FromSf(softfloat_exceptionFlags); }
+  // A lane's floating-point result. A denormal one is tiny (exact or not):
+  // underflow when that is unmasked; with it masked and FTZ set, the zero
+  // of its sign, with UE and PE (SDM vol. 1, 10.2.3.3).
+  template <bool D>
+  typename Fmt<D>::U Result(typename Fmt<D>::U r) {
+    if (!IsDenormal<D>(r)) return r;
+    if (!(c.mxcsr & kUE << 7)) {
+      flags |= kUE;
+    } else if (c.mxcsr & kFTZ) {
+      flags |= kUE | kPE;
+      r &= ~(Fmt<D>::kExp | Fmt<D>::kFrac);
+    }
+    return r;
+  }
+  // Commits the flags; an unmasked one would have raised #XM instead.
+  void Finish() {
+    uint32_t unmasked = flags & ~(c.mxcsr >> 7) & 0x3F;
+    if (unmasked)
+      FatalF("sse: unmasked SIMD exception %02X at %08llX (#XM not modelled)",
+             unmasked, (unsigned long long)va);
+    c.mxcsr |= flags;
+  }
+};
+
+template <bool D>
+typename Fmt<D>::U ArithLane(Scope& sc, Op op, typename Fmt<D>::U a,
+                             typename Fmt<D>::U b) {
+  a = sc.Daz<D>(a);
+  b = sc.Daz<D>(b);
+  if (IsNaN<D>(a) || IsNaN<D>(b)) {
+    if (IsSNaN<D>(a) || IsSNaN<D>(b)) sc.flags |= kIE;
+    return IsNaN<D>(a) ? Quiet<D>(a) : Quiet<D>(b);
+  }
+  // Division by zero takes precedence over a denormal dividend (no DE).
+  using U = typename Fmt<D>::U;
+  constexpr U kSign = U(1) << (sizeof(U) * 8 - 1);
+  if (!(op == kDiv && !(b & ~kSign))) sc.Operand<D>(a);
+  sc.Operand<D>(b);
+  sc.Begin();
+  U r;
+  if constexpr (D) {
+    float64_t x{a}, y{b};
+    switch (op) {
+      case kAdd: r = f64_add(x, y).v; break;
+      case kSub: r = f64_sub(x, y).v; break;
+      case kMul: r = f64_mul(x, y).v; break;
+      default: r = f64_div(x, y).v; break;
+    }
+  } else {
+    float32_t x{a}, y{b};
+    switch (op) {
+      case kAdd: r = f32_add(x, y).v; break;
+      case kSub: r = f32_sub(x, y).v; break;
+      case kMul: r = f32_mul(x, y).v; break;
+      default: r = f32_div(x, y).v; break;
+    }
+  }
+  sc.End();
+  return sc.Result<D>(r);
+}
+
+template <bool D>
+typename Fmt<D>::U SqrtLane(Scope& sc, typename Fmt<D>::U a) {
+  a = sc.Daz<D>(a);
+  if (IsNaN<D>(a)) {
+    if (IsSNaN<D>(a)) sc.flags |= kIE;
+    return Quiet<D>(a);
+  }
+  // A negative operand is invalid, which takes precedence over a denormal
+  // one (no DE).
+  using U = typename Fmt<D>::U;
+  constexpr U kSign = U(1) << (sizeof(U) * 8 - 1);
+  if (!(a & kSign) || !(a & ~kSign)) sc.Operand<D>(a);
+  sc.Begin();
+  U r;
+  if constexpr (D)
+    r = f64_sqrt(float64_t{a}).v;  // negative: default NaN, invalid
+  else
+    r = f32_sqrt(float32_t{a}).v;
+  sc.End();
+  return r;
+}
+
+template <bool D>
+void SqrtT(Ctx& c, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  Xmm r = d;
+  for (int i = 0; i < lanes; i++) SetLane<U>(r, i, SqrtLane<D>(sc, Lane<U>(s, i)));
+  sc.Finish();
+  d = r;
+}
+
+template <bool D>
+void ArithT(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  Xmm r = d;
+  for (int i = 0; i < lanes; i++)
+    SetLane<U>(r, i, ArithLane<D>(sc, op, Lane<U>(d, i), Lane<U>(s, i)));
+  sc.Finish();
+  d = r;
+}
+
+// Ordered comparison of two non-NaN values: -1, 0, 1. Zeros of either
+// sign compare equal.
+template <bool D>
+int Order(typename Fmt<D>::U a, typename Fmt<D>::U b) {
+  using U = typename Fmt<D>::U;
+  constexpr U kSign = U(1) << (sizeof(U) * 8 - 1);
+  if (!((a | b) & ~kSign)) return 0;
+  bool na = a & kSign, nb = b & kSign;
+  if (na != nb) return na ? -1 : 1;
+  if (a == b) return 0;
+  bool less = (a < b) != na;  // magnitude order flips for negatives
+  return less ? -1 : 1;
+}
+
+template <bool D>
+void CmpT(Ctx& c, int lanes, Xmm& d, const Xmm& s, uint8_t pred, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  // Per predicate (low four bits): the result when unordered, and whether
+  // a QNaN signals (flipped by bit 4).
+  static constexpr bool kUnord[16] = {false, false, false, true, true, true, true, false,
+                                      true, true, true, false, false, false, false, true};
+  static constexpr bool kSignal[16] = {false, true, true, false, false, true, true, false,
+                                       false, true, true, false, false, true, true, false};
+  const int p = pred & 15;
+  const bool signal_qnan = kSignal[p] != bool(pred & 16);
+  Xmm r = d;
+  for (int i = 0; i < lanes; i++) {
+    U a = sc.Daz<D>(Lane<U>(d, i)), b = sc.Daz<D>(Lane<U>(s, i));
+    bool unord = IsNaN<D>(a) || IsNaN<D>(b);
+    bool res;
+    if (unord) {
+      if (IsSNaN<D>(a) || IsSNaN<D>(b) || signal_qnan) sc.flags |= kIE;
+      res = kUnord[p];
+    } else {
+      sc.Operand<D>(a);
+      sc.Operand<D>(b);
+      int o = Order<D>(a, b);
+      switch (p) {
+        case 0: case 8: res = o == 0; break;
+        case 1: case 9: res = o < 0; break;          // LT; NGE (not >=)
+        case 2: case 10: res = o <= 0; break;        // LE; NGT
+        case 3: case 11: res = false; break;         // UNORD; FALSE
+        case 4: case 12: res = o != 0; break;
+        case 5: case 13: res = !(o < 0); break;      // NLT; GE
+        case 6: case 14: res = !(o <= 0); break;     // NLE; GT
+        default: res = true; break;                  // ORD; TRUE
+      }
+    }
+    SetLane<U>(r, i, res ? U(~U(0)) : U(0));
+  }
+  sc.Finish();
+  d = r;
+}
+
+template <bool D>
+int ComiT(Ctx& c, bool ordered, const Xmm& x, const Xmm& y, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  U a = sc.Daz<D>(Lane<U>(x, 0)), b = sc.Daz<D>(Lane<U>(y, 0));
+  int r;
+  if (IsNaN<D>(a) || IsNaN<D>(b)) {
+    if (ordered || IsSNaN<D>(a) || IsSNaN<D>(b)) sc.flags |= kIE;
+    r = 3;
+  } else {
+    sc.Operand<D>(a);
+    sc.Operand<D>(b);
+    int o = Order<D>(a, b);
+    r = o > 0 ? 0 : o < 0 ? 1 : 2;
+  }
+  sc.Finish();
+  return r;
+}
+
+template <bool D>
+void MinMaxT(Ctx& c, bool max, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  Xmm r = d;
+  for (int i = 0; i < lanes; i++) {
+    U a = sc.Daz<D>(Lane<U>(d, i)), b = sc.Daz<D>(Lane<U>(s, i));
+    U v = b;  // NaNs and equal values (zeros of either sign too) give s
+    if (IsNaN<D>(a) || IsNaN<D>(b)) {
+      sc.flags |= kIE;  // an ordered comparison: QNaNs are invalid too
+    } else {
+      sc.Operand<D>(a);
+      sc.Operand<D>(b);
+      int o = Order<D>(a, b);
+      if (max ? o > 0 : o < 0) v = a;
+    }
+    SetLane<U>(r, i, v);
+  }
+  sc.Finish();
+  d = r;
+}
+
+// One float <-> double conversion. NaNs keep their payload (truncated or
+// extended) and are quieted, as SoftFloat's 8086 NaN conversion does.
+template <bool FromDbl>
+typename Fmt<!FromDbl>::U CvtLane(Scope& sc, typename Fmt<FromDbl>::U a) {
+  a = sc.Daz<FromDbl>(a);
+  if (!IsNaN<FromDbl>(a)) sc.Operand<FromDbl>(a);
+  sc.Begin();
+  typename Fmt<!FromDbl>::U r;
+  if constexpr (FromDbl)
+    r = f64_to_f32(float64_t{a}).v;
+  else
+    r = f32_to_f64(float32_t{a}).v;
+  sc.End();
+  return sc.Result<!FromDbl>(r);
+}
+
+template <bool D>
+void HorizOpT(Ctx& c, bool sub, Xmm& d, const Xmm& s, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  constexpr int n = D ? 2 : 4;
+  Scope sc(c, va);
+  Xmm r;
+  for (int i = 0; i < n; i++) {
+    const Xmm& x = i < n / 2 ? d : s;
+    int k = 2 * (i % (n / 2));
+    SetLane<U>(r, i, ArithLane<D>(sc, sub ? kSub : kAdd, Lane<U>(x, k), Lane<U>(x, k + 1)));
+  }
+  sc.Finish();
+  d = r;
+}
+
+template <bool D>
+void AddSubT(Ctx& c, Xmm& d, const Xmm& s, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  Xmm r;
+  for (int i = 0; i < (D ? 2 : 4); i++)
+    SetLane<U>(r, i, ArithLane<D>(sc, i & 1 ? kAdd : kSub, Lane<U>(d, i), Lane<U>(s, i)));
+  sc.Finish();
+  d = r;
+}
+
+// One lane to an integral value. Only SNaN (IE) and inexact (PE, unless
+// suppressed) are signalled: no DE.
+template <bool D>
+typename Fmt<D>::U RoundLane(Scope& sc, typename Fmt<D>::U a, uint8_t imm) {
+  if (IsNaN<D>(a)) {
+    if (IsSNaN<D>(a)) sc.flags |= kIE;
+    return Quiet<D>(a);
+  }
+  a = sc.Daz<D>(a);
+  static constexpr uint8_t kModes[4] = {softfloat_round_near_even, softfloat_round_min,
+                                        softfloat_round_max, softfloat_round_minMag};
+  const uint8_t mode = imm & 4 ? RoundingMode(sc.c.mxcsr) : kModes[imm & 3];
+  const bool exact = !(imm & 8);
+  sc.Begin();
+  typename Fmt<D>::U r;
+  if constexpr (D)
+    r = f64_roundToInt(float64_t{a}, mode, exact).v;
+  else
+    r = f32_roundToInt(float32_t{a}, mode, exact).v;
+  sc.End();
+  return r;
+}
+
+template <bool D>
+void RoundT(Ctx& c, int lanes, Xmm& d, const Xmm& s, uint8_t imm, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  Scope sc(c, va);
+  Xmm r = d;
+  for (int i = 0; i < lanes; i++) SetLane<U>(r, i, RoundLane<D>(sc, Lane<U>(s, i), imm));
+  sc.Finish();
+  d = r;
+}
+
+template <bool D>
+void DpT(Ctx& c, Xmm& d, const Xmm& s, uint8_t imm, uint64_t va) {
+  using U = typename Fmt<D>::U;
+  constexpr int n = D ? 2 : 4;
+  Scope sc(c, va);
+  U p[4];
+  for (int i = 0; i < n; i++)
+    p[i] = imm >> (4 + i) & 1 ? ArithLane<D>(sc, kMul, Lane<U>(d, i), Lane<U>(s, i)) : U(0);
+  U sum = ArithLane<D>(sc, kAdd, p[0], p[1]);
+  if constexpr (!D)
+    sum = ArithLane<D>(sc, kAdd, sum, ArithLane<D>(sc, kAdd, p[2], p[3]));
+  Xmm r{};
+  for (int i = 0; i < n; i++)
+    if (imm >> i & 1) SetLane<U>(r, i, sum);
+  sc.Finish();
+  d = r;
+}
+
+}  // namespace
+
+void HorizOp(Ctx& c, bool dbl, bool sub, Xmm& d, const Xmm& s, uint64_t va) {
+  if (dbl)
+    HorizOpT<true>(c, sub, d, s, va);
+  else
+    HorizOpT<false>(c, sub, d, s, va);
+}
+
+void AddSub(Ctx& c, bool dbl, Xmm& d, const Xmm& s, uint64_t va) {
+  if (dbl)
+    AddSubT<true>(c, d, s, va);
+  else
+    AddSubT<false>(c, d, s, va);
+}
+
+void Round(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t imm, uint64_t va) {
+  if (dbl)
+    RoundT<true>(c, lanes, d, s, imm, va);
+  else
+    RoundT<false>(c, lanes, d, s, imm, va);
+}
+
+void Dp(Ctx& c, bool dbl, Xmm& d, const Xmm& s, uint8_t imm, uint64_t va) {
+  if (dbl)
+    DpT<true>(c, d, s, imm, va);
+  else
+    DpT<false>(c, d, s, imm, va);
+}
+
+// The float nearest to 1/x (SoftFloat's division is correctly rounded),
+// results below the normal range flushed to zero as the SDM requires.
+uint32_t RcpLane(uint32_t x) {
+  const uint32_t exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF, sign = x & 0x80000000u;
+  if (exp == 0xFF && frac) return x | 0x00400000u;  // NaN: quieted
+  if (exp == 0) return sign | 0x7F800000u;           // ±0, denormal: ±inf
+  if (exp == 0xFF) return sign;                      // ±inf: ±0
+  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
+  softfloat_roundingMode = softfloat_round_near_even;
+  uint32_t r = f32_div(float32_t{0x3F800000u}, float32_t{x}).v;
+  softfloat_roundingMode = mode;
+  softfloat_exceptionFlags = flags;
+  if (!(r & 0x7F800000u)) r &= 0x80000000u;  // tiny: ±0
+  return r;
+}
+
+void Rcp(Xmm& d, const Xmm& s) {
+  Xmm r;
+  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RcpLane(Lane<uint32_t>(s, i)));
+  d = r;
+}
+
+void CheckAligned(Ctx& c, uint64_t a, uint64_t va) {
+  (void)c;
+  if (a & 15)
+    FatalF("sse: misaligned 16-byte operand %08llX at %08llX (#GP)",
+           (unsigned long long)a, (unsigned long long)va);
+}
+
+void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
+  (void)c;
+  if (a & (align - 1))
+    FatalF("sse: misaligned %u-byte operand %08llX at %08llX (#GP)", align,
+           (unsigned long long)a, (unsigned long long)va);
+}
+
+void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+           uint64_t va) {
+  if (dbl)
+    ArithT<true>(c, op, lanes, d, s, va);
+  else
+    ArithT<false>(c, op, lanes, d, s, va);
+}
+
+void Cmp(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint8_t pred,
+         uint64_t va) {
+  if (dbl)
+    CmpT<true>(c, lanes, d, s, pred, va);
+  else
+    CmpT<false>(c, lanes, d, s, pred, va);
+}
+
+int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
+         uint64_t va) {
+  return dbl ? ComiT<true>(c, ordered, a, b, va) : ComiT<false>(c, ordered, a, b, va);
+}
+
+void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  if (dbl)
+    SqrtT<true>(c, lanes, d, s, va);
+  else
+    SqrtT<false>(c, lanes, d, s, va);
+}
+
+// For a positive normal x, the float nearest to y = 1/sqrt(x). A first
+// guess from binary64 (sqrt, then a division: two roundings, then a
+// third to binary32) is checked exactly and moved by an ulp if needed:
+// r is correct iff y lies between the midpoints to its neighbours, i.e.
+// lo^2 * x <= 1 <= hi^2 * x, evaluated in 128-bit integers. y is never a
+// midpoint (it would be a dyadic rational with a 25-bit significand whose
+// square's reciprocal is a float), so there are no ties.
+uint32_t RsqrtLane(uint32_t x) {
+  const uint32_t exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF;
+  if (exp == 0xFF && frac) return x | 0x00400000u;     // NaN: quieted
+  if (exp == 0) return (x & 0x80000000u) | 0x7F800000u;  // ±0, denormal: ±inf
+  if (x & 0x80000000u) return 0xFFC00000u;               // negative: default NaN
+  if (exp == 0xFF) return 0;                             // +inf: +0
+  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
+  softfloat_roundingMode = softfloat_round_near_even;
+  float64_t one{0x3FF0000000000000ull};
+  uint32_t r = f64_to_f32(f64_div(one, f64_sqrt(f32_to_f64(float32_t{x})))).v;
+  softfloat_roundingMode = mode;
+  softfloat_exceptionFlags = flags;
+  const unsigned __int128 mx = frac | 0x800000u;
+  const int ex = int(exp) - 150;  // x = mx * 2^ex
+  for (;;) {
+    const uint32_t rexp = (r >> 23) & 0xFF;
+    const unsigned __int128 mr = (r & 0x7FFFFF) | 0x800000u;
+    const int er = int(rexp) - 150;  // r = mr * 2^er
+    // Midpoints in units of 2^(er-2): the one below is closer when r's
+    // significand is a power of two (the next float down has half the ulp).
+    const unsigned __int128 lo = 4 * mr - (mr == 0x800000u ? 1 : 2), hi = 4 * mr + 2;
+    const int shift = -(2 * (er - 2) + ex);  // 1 = 2^shift in those units
+    const unsigned __int128 one_scaled = static_cast<unsigned __int128>(1) << shift;
+    if (lo * lo * mx > one_scaled)
+      r--;
+    else if (hi * hi * mx < one_scaled)
+      r++;
+    else
+      return r;
+  }
+}
+
+void Rsqrt(Xmm& d, const Xmm& s) {
+  Xmm r;
+  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
+  d = r;
+}
+
+void Cvtsi2sd(Xmm& d, int32_t v) { SetLane<uint64_t>(d, 0, i32_to_f64(v).v); }
+
+uint32_t CvtToI32(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+  Scope sc(c, va);
+  uint8_t mode = truncate ? uint8_t(softfloat_round_minMag) : RoundingMode(c.mxcsr);
+  sc.Begin();
+  int32_t r = dbl ? f64_to_i32(float64_t{sc.Daz<true>(Lane<uint64_t>(s, 0))}, mode, true)
+                  : f32_to_i32(float32_t{sc.Daz<false>(Lane<uint32_t>(s, 0))}, mode, true);
+  sc.End();
+  sc.Finish();
+  return uint32_t(r);
+}
+
+uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+  Scope sc(c, va);
+  uint8_t mode = truncate ? uint8_t(softfloat_round_minMag) : RoundingMode(c.mxcsr);
+  sc.Begin();
+  int64_t r = dbl ? f64_to_i64(float64_t{sc.Daz<true>(Lane<uint64_t>(s, 0))}, mode, true)
+                  : f32_to_i64(float32_t{sc.Daz<false>(Lane<uint32_t>(s, 0))}, mode, true);
+  sc.End();
+  sc.Finish();
+  return uint64_t(r);
+}
+
+void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+            uint64_t va) {
+  if (dbl)
+    MinMaxT<true>(c, max, lanes, d, s, va);
+  else
+    MinMaxT<false>(c, max, lanes, d, s, va);
+}
+
+void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+  Scope sc(c, va);
+  Xmm r = d;
+  if (to_dbl) {
+    for (int i = 0; i < lanes; i++)
+      SetLane<uint64_t>(r, i, CvtLane<false>(sc, Lane<uint32_t>(s, i)));
+  } else {
+    for (int i = 0; i < lanes; i++)
+      SetLane<uint32_t>(r, i, CvtLane<true>(sc, Lane<uint64_t>(s, i)));
+    if (lanes == 2) SetLane<uint64_t>(r, 1, 0);  // CVTPD2PS zeroes the top
+  }
+  sc.Finish();
+  d = r;
+}
+
+void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
+  Scope sc(c, va);
+  sc.Begin();
+  if (dbl)
+    SetLane<uint64_t>(d, 0, src64 ? i64_to_f64(int64_t(v)).v : i32_to_f64(int32_t(v)).v);
+  else
+    SetLane<uint32_t>(d, 0, src64 ? i64_to_f32(int64_t(v)).v : i32_to_f32(int32_t(v)).v);
+  sc.End();
+  sc.Finish();
+}
+
+void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va) {
+  Scope sc(c, va);
+  const uint8_t mode = truncate ? uint8_t(softfloat_round_minMag) : RoundingMode(c.mxcsr);
+  Xmm r{};
+  sc.Begin();
+  for (int i = 0; i < (dbl ? 2 : 4); i++) {
+    int32_t v = dbl ? f64_to_i32(float64_t{sc.Daz<true>(Lane<uint64_t>(s, i))}, mode, true)
+                    : f32_to_i32(float32_t{sc.Daz<false>(Lane<uint32_t>(s, i))}, mode, true);
+    SetLane<int32_t>(r, i, v);
+  }
+  sc.End();
+  sc.Finish();
+  d = r;
+}
+
+void Cvtdq2ps(Ctx& c, Xmm& d, const Xmm& s, uint64_t va) {
+  Scope sc(c, va);
+  Xmm r;
+  sc.Begin();
+  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, i32_to_f32(Lane<int32_t>(s, i)).v);
+  sc.End();
+  sc.Finish();
+  d = r;
+}
+
+// F16C. Half to single is exact: no rounding, DAZ and FTZ do not apply;
+// an SNaN is quieted (IE), NaNs keep their payload.
+void Cvtph2ps(Ctx& c, Xmm& d, const Xmm& s, int from, uint64_t va) {
+  Scope sc(c, va);
+  Xmm r;
+  for (int i = 0; i < 4; i++) {
+    sc.Begin();
+    SetLane<uint32_t>(r, i, f16_to_f32(float16_t{Lane<uint16_t>(s, from + i)}).v);
+    sc.End();
+  }
+  sc.Finish();
+  d = r;
+}
+
+// Single to half, rounded by imm bits 1:0 (bit 2: MXCSR's mode instead).
+// DAZ applies to the operands; the half results are not flushed (FTZ).
+void Cvtps2ph(Ctx& c, Xmm& d, int to, const Xmm& s, uint8_t imm, uint64_t va) {
+  Scope sc(c, va);
+  if (!(imm & 4)) softfloat_roundingMode = RoundingMode(uint32_t(imm & 3) << 13);
+  Xmm r = d;
+  for (int i = 0; i < 4; i++) {
+    uint32_t a = sc.Daz<false>(Lane<uint32_t>(s, i));
+    if (!IsNaN<false>(a)) sc.Operand<false>(a);
+    sc.Begin();
+    const uint16_t h = f32_to_f16(float32_t{a}).v;
+    sc.End();
+    if ((h & 0x7C00) == 0 && (h & 0x3FF) && !(c.mxcsr & kUE << 7)) sc.flags |= kUE;
+    SetLane<uint16_t>(r, to + i, h);
+  }
+  sc.Finish();
+  d = r;
+}
+
+void Ldmxcsr(Ctx& c, uint32_t v, uint64_t va) {
+  if (v & 0xFFFF0000u)
+    FatalF("sse: ldmxcsr %08X sets reserved bits at %08llX (#GP)", v,
+           (unsigned long long)va);
+  c.mxcsr = v;
+}
+
+}  // namespace recomp::sse
