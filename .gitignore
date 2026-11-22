@@ -1,0 +1,34 @@
+# Binaries & Game Assets (BYO Assets rule - Never commit)
+*.exe
+*.dll
+*.so
+*.dylib
+*.upk
+*.tfc
+*.bnk
+*.bik
+*.sav
+
+# Build & Tool outputs
+build/
+bin/
+obj/
+dist/
+*.o
+*.a
+*.ninja
+.ninja_*
+
+# Lifted code (Auto-generated - keep out of repo or handle via gen pipeline)
+gen/
+
+# Logs & Dumps
+*.log
+*.dmp
+*.tmp
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
