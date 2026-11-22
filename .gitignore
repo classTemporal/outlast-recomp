@@ -36,3 +36,4 @@ gen/
 .idea/
 .DS_Store
 Thumbs.db
+lifter.manifest
