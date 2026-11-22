@@ -1,0 +1,16 @@
+=======================================================
+Phase 1 Static Code Coverage Report for Outlast (Win64)
+=======================================================
+Target Binary: /home/agy2/nextcloud/backup/OLGame.exe
+Image Base: 0x0000000140000000
+.text Section RVA: 0x00001000 - 0x0145F0AF
+.text Virtual Size: 21356719 bytes (20.37 MB)
+
+Discovered Functions (.pdata SEH Table): 92098
+Total Function Bytes Covered: 19429166 bytes (18.53 MB)
+Calculated Code Coverage: 90.97%
+
+Unresolved Jump Tables / Indirect Calls:
+- Win64 MSVC uses RIP-relative displacement tables in .rdata for switch statements.
+- Cataloged in jump_tables.json via .rdata xref scan.
+Exit Gate Status: VERIFIED (Phase 1 Code Catalog Complete)
