@@ -1,0 +1,60 @@
+{
+  "file": "OLGame.exe",
+  "is_64bit": true,
+  "machine": 34404,
+  "image_base": "0x0000000140000000",
+  "entry_point": "0x0121A4C0",
+  "subsystem": 2,
+  "sections": [
+    {
+      "name": ".text",
+      "virtual_address": "0x00001000",
+      "virtual_size": "0x0145E0AF",
+      "raw_size": "0x0145E200",
+      "raw_pointer": "0x00000400",
+      "characteristics": "0x60000020"
+    },
+    {
+      "name": ".rdata",
+      "virtual_address": "0x01460000",
+      "virtual_size": "0x0099AAA0",
+      "raw_size": "0x0099AC00",
+      "raw_pointer": "0x0145E600",
+      "characteristics": "0x40000040"
+    },
+    {
+      "name": ".data",
+      "virtual_address": "0x01DFB000",
+      "virtual_size": "0x0024B880",
+      "raw_size": "0x000C6E00",
+      "raw_pointer": "0x01DF9200",
+      "characteristics": "0xC0000040"
+    },
+    {
+      "name": ".pdata",
+      "virtual_address": "0x02047000",
+      "virtual_size": "0x0010DD18",
+      "raw_size": "0x0010DE00",
+      "raw_pointer": "0x01EC0000",
+      "characteristics": "0x40000040"
+    },
+    {
+      "name": ".rsrc",
+      "virtual_address": "0x02155000",
+      "virtual_size": "0x00015048",
+      "raw_size": "0x00015200",
+      "raw_pointer": "0x01FCDE00",
+      "characteristics": "0x40000040"
+    },
+    {
+      "name": ".reloc",
+      "virtual_address": "0x0216B000",
+      "virtual_size": "0x000C0122",
+      "raw_size": "0x000C0200",
+      "raw_pointer": "0x01FE3000",
+      "characteristics": "0x42000040"
+    }
+  ],
+  "dll_count": 32,
+  "total_import_count": 623
+}
