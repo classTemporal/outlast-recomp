@@ -7,6 +7,10 @@
 
 #include "runtime/write_watch.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 namespace recomp {
 
 namespace {
@@ -96,6 +100,14 @@ bool GuestMemory::Protect(gaddr va, uint64_t size, Prot prot) {
 
 void GuestMemory::Decommit(gaddr va, uint64_t size, bool zero) {
   if (!size || !InRange(va, size)) return;
+  // The object at 0x10007B1A0 loses its vtable without the write-watch firing,
+  // which points at the page being unmapped underneath it. Log every decommit
+  // that could touch it.
+  if (va <= 0x10007B1A0ULL + 0x40 && 0x10007B1A0ULL < va + size) {
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "Decommit hits watched object: va=0x%llX size=0x%llX",
+                        (unsigned long long)va, (unsigned long long)size);
+  }
   watch::Release(va, size);
   uint64_t first = va / kPageSize, last = (uint64_t(va) + size - 1) / kPageSize;
   for (uint64_t g = first; g <= last; g++) {

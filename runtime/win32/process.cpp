@@ -1,0 +1,324 @@
+// The Win32 process (win32/process.h): the PE image and lifted DLLs, the
+// PEB, TEBs and static TLS, on the x86 core's process.
+
+#include "win32/process.h"
+
+#include <algorithm>
+#include <cstring>
+#include <dlfcn.h>
+#include <mutex>
+#include <set>
+#include <android/log.h>
+
+#include "runtime/core/env.h"
+#include "runtime/log.h"
+#include "win32/hle.h"
+#include "win32/kernel32_state.h"
+#include "win32/user32_window.h"
+#include "win32/seh64.h"
+
+namespace recomp {
+
+void DumpAllGuestThreads(const char* what);
+
+namespace hle {
+bool RaiseAccessViolation(Ctx& c, bool write, uint32_t addr);
+}
+
+Win32Process* g_win32 = nullptr;
+
+const win32::GameConfig& Game() { return g_win32->game; }
+
+namespace {
+
+constexpr uint32_t kTlsArraySlots = 64;
+
+// TEBs: a finished thread's is taken back and handed out again before a
+// new one is cut below the others.
+std::mutex g_teb_mu;
+gaddr g_next_teb = 0;  // the next new TEB is below it (kTebTop, kTebTop64)
+std::vector<gaddr> g_free_tebs;
+std::set<gaddr> g_live_tebs;
+
+// The image's .text, where its lifted functions are.
+std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
+  for (const auto& s : img.sections)
+    if (s.name == ".text") return {s.va, s.vsize};
+  return {0, 0};
+}
+
+// Process::thread_init: the thread's TEB and TLS array, in the layout of
+// the process's mode, found through fs (32-bit) or gs (x64).
+void InitTeb(Thread* t) {
+  Process& p = *g_proc;
+  const Win32Process& w = *g_win32;
+  const uint32_t stride = p.x64 ? kTebStride64 : kTebStride;
+  gaddr teb;
+  {
+    std::lock_guard<std::mutex> l(g_teb_mu);
+    if (!g_free_tebs.empty()) {
+      teb = g_free_tebs.back();
+      g_free_tebs.pop_back();
+    } else {
+      const gaddr lo = p.x64 ? kTebLo64 : kTebLo;
+      if (!g_next_teb) g_next_teb = p.x64 ? kTebTop64 : kTebTop;
+      if (g_next_teb - lo < stride)
+        FatalF("too many guest threads at once: %llu TEBs in use",
+               (unsigned long long)g_live_tebs.size());
+      g_next_teb -= stride;
+      teb = g_next_teb;
+    }
+    p.mem.Commit(teb, stride, Prot::RW);
+    g_live_tebs.insert(teb);
+  }
+  if (p.x64)
+    t->ctx.gs_base = teb;
+  else
+    t->ctx.fs_base = teb;
+  // Static TLS of the image (__declspec(thread)): a per-thread copy of the
+  // template, found through the TEB's ThreadLocalStoragePointer
+  // [tls_index].
+  const uint32_t ptr = p.x64 ? 8 : 4;
+  gaddr tls_array = HeapAllocProcess(kTlsArraySlots * ptr, true);
+  if (p.x64) {  // NT_TIB64 and the x64 TEB
+    Wr64(teb + 0x08, t->stack_hi);  // StackBase
+    Wr64(teb + 0x10, t->stack_lo);  // StackLimit
+    Wr64(teb + 0x30, teb);          // Self
+    Wr64(teb + 0x40, kGuestPid);    // ClientId
+    Wr64(teb + 0x48, t->tid);
+    Wr64(teb + 0x58, tls_array);    // ThreadLocalStoragePointer
+    Wr64(teb + 0x60, kPebVa64);
+  } else {
+    Wr32(teb + 0x00, 0xFFFFFFFF);  // SEH chain: empty
+    Wr32(teb + 0x04, uint32_t(t->stack_hi));
+    Wr32(teb + 0x08, uint32_t(t->stack_lo));
+    Wr32(teb + 0x18, uint32_t(teb));  // Self
+    Wr32(teb + 0x20, kGuestPid);
+    Wr32(teb + 0x24, t->tid);
+    Wr32(teb + 0x2C, uint32_t(tls_array));
+    Wr32(teb + 0x30, kPebVa);
+  }
+  auto block = [&](const PeImage& img, int index) {
+    const PeTls& tls = img.tls;
+    uint64_t raw = tls.raw_end - tls.raw_start;
+    gaddr b = HeapAllocProcess(raw + tls.zero_fill + 16, true);
+    std::memcpy(GPtr(b), GPtr(tls.raw_start), raw);
+    WrPtr(tls_array + ptr * uint32_t(index), b);
+  };
+  if (w.img.has_tls) block(w.img, 0);
+  // Lifted DLLs with static TLS (x64 guests, as on Vista and later): every
+  // thread has their blocks, loaded or not, since all are mapped at start.
+  for (const Module& m : w.modules)
+    if (m.tls_index >= 0) block(m.img, m.tls_index);
+}
+
+// Process::thread_exit: whoever waits for the thread may go on, then what
+// it had goes back (its guest code has finished): the static TLS blocks
+// and their array, and the TEB. The core releases the stack itself after
+// this hook.
+void FinishThread(Thread* t, uint32_t code) {
+  OnGuestThreadFinished(t->tid, code);
+  Process& p = *g_proc;
+  const Win32Process& w = *g_win32;
+  const gaddr teb = Teb(t);
+  const uint32_t ptr = p.x64 ? 8 : 4;
+  const gaddr tls_array = RdPtr(teb + (p.x64 ? 0x58 : 0x2C));
+  if (w.img.has_tls) HeapFreeProcess(RdPtr(tls_array));
+  for (const Module& m : w.modules)
+    if (m.tls_index >= 0) HeapFreeProcess(RdPtr(tls_array + ptr * uint32_t(m.tls_index)));
+  HeapFreeProcess(tls_array);
+  {
+    std::lock_guard<std::mutex> l(g_teb_mu);
+    g_live_tebs.erase(teb);
+    p.mem.Decommit(teb, p.x64 ? kTebStride64 : kTebStride);
+    g_free_tebs.push_back(teb);
+  }
+}
+
+// Static TLS callbacks are not run (no supported module has any).
+void CheckNoTlsCallbacks(const PeImage& img, const std::string& name) {
+  if (img.has_tls && img.tls.callbacks && RdPtr(img.tls.callbacks))
+    FatalF("%s has TLS callbacks: not supported", name.c_str());
+}
+
+}  // namespace
+
+void ForEachTeb(const std::function<void(gaddr teb)>& f) {
+  std::lock_guard<std::mutex> l(g_teb_mu);
+  for (gaddr teb : g_live_tebs) f(teb);
+}
+
+const PeImage* ImageAt(gaddr va) {
+  const Win32Process& w = *g_win32;
+  if (va - w.img.image_base < w.img.image_size) return &w.img;
+  for (const Module& m : w.modules)
+    if (va - m.img.image_base < m.img.image_size) return &m.img;
+  return nullptr;
+}
+
+void MapModule(Module& m) {
+  Process& p = *g_proc;
+  if (m.img.image_size) p.mem.Decommit(m.img.image_base, m.img.image_size);
+  std::string err;
+  if (!m.img.Load(m.host_path, p.mem, &err, m.base, hle::ImportThunk))
+    FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
+  // Windows XP did not set up static TLS for LoadLibrary'd DLLs either,
+  // so 32-bit DLLs of that era have none. x64 ones get a slot of their own
+  // after the EXE's (slot 0), kept across remaps.
+  if (m.img.has_tls) {
+    if (!p.x64)
+      FatalF("lifted DLL %s has static TLS (__declspec(thread)): not supported",
+             m.name.c_str());
+    CheckNoTlsCallbacks(m.img, m.name);
+    if (m.tls_index < 0) {
+      int next = 1;
+      for (const Module& o : g_win32->modules) next = std::max(next, o.tls_index + 1);
+      m.tls_index = next;
+    }
+    Wr32(m.img.tls.index_va, uint32_t(m.tls_index));
+  }
+  m.stale = false;
+}
+
+int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
+               const std::string& game_dir, const std::string& game_args) {
+  g_win32 = new Win32Process;
+  Win32Process& w = *g_win32;
+  w.game = game;
+  // <ID>_<SWITCH> (runtime/env.h): without this Env() always returns null and
+  // every runtime switch is silently off.
+  SetEnvId(game.id);
+  Process& p = StartProcess(game, game_dir, PeImage::IsX64File(exe_path));
+  p.thread_init = InitTeb;
+  p.thread_exit = FinishThread;
+  p.guest_fault = [](Ctx& c, bool write, gaddr addr) {
+    if (g_proc->x64) {
+      unwind::Regs at = hle::seh64::AtReturn(c);
+      uintptr_t host_pc = LastFaultHostPc();
+      const char* sym = "unknown";
+      Dl_info dli;
+      if (host_pc && dladdr(reinterpret_cast<void*>(host_pc), &dli) && dli.dli_sname) {
+        sym = dli.dli_sname;
+        const char* p = std::strstr(dli.dli_sname, "f_");
+        if (p) {
+          char hex_buf[16] = {0};
+          int len = 0;
+          p += 2;
+          while (len < 9 && ((p[len] >= '0' && p[len] <= '9') ||
+                             (p[len] >= 'a' && p[len] <= 'f') ||
+                             (p[len] >= 'A' && p[len] <= 'F'))) {
+            hex_buf[len] = p[len];
+            len++;
+          }
+          uint64_t gva = std::strtoull(hex_buf, nullptr, 16);
+          if (gva) {
+            at.rip = gva;
+            at.gpr[4] = c.rsp; // rsp is index 4 (kRsp)
+          }
+        }
+      }
+      char fault_buf[512];
+      uintptr_t sym_offset = host_pc && dli.dli_saddr ? (host_pc - reinterpret_cast<uintptr_t>(dli.dli_saddr)) : 0;
+      std::snprintf(fault_buf, sizeof(fault_buf),
+        "GUEST FAULT: write=%d addr=0x%llX host_pc=0x%zx (+0x%zx in %s) rsp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX r8=0x%llX r14=0x%llX r15=0x%llX",
+        write, (unsigned long long)addr, host_pc, sym_offset, sym, (unsigned long long)c.rsp,
+        (unsigned long long)c.rax, (unsigned long long)c.rcx, (unsigned long long)c.rdx,
+        (unsigned long long)c.r8, (unsigned long long)c.r14, (unsigned long long)c.r15);
+      __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "%s", fault_buf);
+      if (g_log_writer) g_log_writer(fault_buf);
+      for (uint64_t off = 0; off < 0x400; off += 8) {
+        uint64_t v = 0;
+        if (c.rsp + off >= 0x100000000ULL) v = Rd64(c.rsp + off);
+        if ((v >= 0x140000000ULL && v < 0x145000000ULL) ||
+            (v >= 0x180000000ULL && v < 0x185000000ULL)) {
+          char sbuf[128];
+          std::snprintf(sbuf, sizeof(sbuf), "  [rsp+%04llX] %016llX",
+                        (unsigned long long)off, (unsigned long long)v);
+          __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "%s", sbuf);
+          if (g_log_writer) g_log_writer(sbuf);
+        }
+      }
+      uint64_t params[2] = {write ? 1ull : 0ull, addr};
+      recomp::DumpAllGuestThreads("guest fault");
+      hle::seh64::Raise(c, 0xC0000005, 0, params, 2, at);
+      return true;
+    }
+    return hle::RaiseAccessViolation(c, write, uint32_t(addr));
+  };
+  p.pump_events = PumpHostEvents;
+  w.game_args = game_args;
+  std::string err;
+  for (const auto& d : game.lifted_dlls) {
+    Module& m = w.modules.emplace_back();
+    m.name = hle::NormaliseDll(d.name);
+    m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
+    m.base = d.base;
+    MapModule(m);
+  }
+  if (!w.img.Load(exe_path, p.mem, &err, 0, hle::ImportThunk))
+    FatalF("%s", err.c_str());
+
+  if (p.x64) {
+    // Everything above 4 GiB, below the TEBs.
+    p.vm.Init(&p.mem, kUserLo64, kTebLo64);
+  } else {
+    p.vm.Init(&p.mem, 0x00010000, kThunkBase);
+    p.vm.MarkReserved(hle::kModuleRegion, hle::kModuleRegionSize);
+  }
+  p.vm.MarkReserved(w.img.image_base, w.img.image_size);
+  for (const Module& m : w.modules) p.vm.MarkReserved(m.img.image_base, m.img.image_size);
+
+  // PEB: only the fields Win32 code commonly peeks at. x64 guests see
+  // Windows 10 (22H2), 32-bit ones Windows XP.
+  if (p.x64) {
+    p.mem.Commit(kPebVa64, 0x1000, Prot::RW);
+    Wr64(kPebVa64 + 0x10, w.img.image_base);
+    Wr32(kPebVa64 + 0xB8, GuestProcessorCount());  // NumberOfProcessors
+    Wr32(kPebVa64 + 0x118, 10);     // OSMajorVersion
+    Wr32(kPebVa64 + 0x11C, 0);      // OSMinorVersion
+    Wr16(kPebVa64 + 0x120, 19045);  // OSBuildNumber
+    Wr32(kPebVa64 + 0x124, 2);      // OSPlatformId: VER_PLATFORM_WIN32_NT
+  } else {
+    p.mem.Commit(kPebVa, 0x1000, Prot::RW);
+    Wr32(kPebVa + 0x08, uint32_t(w.img.image_base));
+    Wr32(kPebVa + 0x64, GuestProcessorCount());  // NumberOfProcessors
+    Wr32(kPebVa + 0xA4, 5);      // OSMajorVersion (Windows XP)
+    Wr32(kPebVa + 0xA8, 1);      // OSMinorVersion
+    Wr16(kPebVa + 0xAC, 2600);   // OSBuildNumber
+    Wr32(kPebVa + 0xB0, 2);      // OSPlatformId: VER_PLATFORM_WIN32_NT
+  }
+
+  // The image's TLS index: slot 0 (lifted DLLs have theirs, MapModule).
+  if (w.img.has_tls) {
+    CheckNoTlsCallbacks(w.img, game.exe_name);
+    Wr32(w.img.tls.index_va, 0);
+  }
+
+  // Dispatch looks lifted code up in each image's .text: the EXE's first.
+  p.code.push_back(TextOf(w.img));
+  for (const Module& m : w.modules) p.code.push_back(TextOf(m.img));
+  InitDispatch();
+  for (const Module& m : w.modules) {
+    // A DLL lifted at another base, or not at all, has no functions here.
+    if (m.img.entry && !IsLifted(m.img.entry))
+      FatalF("%s at %08llX: its entry point %08llX is not lifted (lift it with "
+             "recomp_lift --module, at the same --base)",
+             m.name.c_str(), (unsigned long long)m.img.image_base,
+             (unsigned long long)m.img.entry);
+  }
+  InitKernel32State();
+
+  Thread* main = CreateGuestThread(w.img.stack_reserve);
+  RegisterMainThread(main);
+  return int(RunMainThread(main, [&](Ctx& c) {
+    for (Module& m : w.modules) {
+      if (m.refs > 0 && m.img.entry) {
+        m.stale = true;
+        CallGuest(c, m.img.entry, {m.img.image_base, 1, 0});
+      }
+    }
+    return CallGuest(c, w.img.entry, {});
+  }));
+}
+
+}  // namespace recomp

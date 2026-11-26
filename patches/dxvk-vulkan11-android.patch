@@ -1,0 +1,2215 @@
+diff --git a/meson.build b/meson.build
+index 4964301..8d2f6cf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -161,7 +161,9 @@ else
+   if lib_glfw.found()
+     compiler_args += ['-DDXVK_WSI_GLFW']
+   endif
+-  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
++  if platform == 'android'
++    compiler_args += ['-DDXVK_WSI_ANDROID']
++  elif (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
+     error('SDL3, SDL2, or GLFW are required to build dxvk-native')
+   endif
+   
+diff --git a/src/d3d9/d3d9.sym b/src/d3d9/d3d9.sym
+index bbfaee0..1592597 100644
+--- a/src/d3d9/d3d9.sym
++++ b/src/d3d9/d3d9.sym
+@@ -20,6 +20,7 @@
+     Direct3D9ForceHybridEnumeration;
+     Direct3DCreate9On12;
+     Direct3DCreate9On12Ex;
++    dxvk_android_set_window;
+ 
+   local:
+     *;
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+index d672f11..8a05cfa 100644
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -1,4 +1,5 @@
+ #include "d3d9_swapchain.h"
++#include "../util/util_me_trace.h"
+ #include "d3d9_surface.h"
+ #include "d3d9_monitor.h"
+ 
+@@ -112,6 +113,24 @@ namespace dxvk {
+           DWORD    dwFlags) {
+     D3D9DeviceLock lock = m_parent->LockDevice();
+ 
++    if (meTraceOn()) {
++      static uint64_t last, second, worst;
++      static uint32_t frames;
++      uint64_t now = meNowUs();
++      uint64_t delta = last ? now - last : 0u;
++      last = now;
++      frames++;
++      worst = std::max(worst, delta);
++      if (delta >= 40000u)
++        meTrace("hitch %.1f ms", double(delta) / 1000.0);
++      if (now - second >= 1000000u) {
++        meTrace("second frames=%u worst=%.1f ms", frames, double(worst) / 1000.0);
++        second = now;
++        frames = 0u;
++        worst = 0u;
++      }
++    }
++
+     m_parent->SetMostRecentlyUsedSwapchain(this);
+ 
+     if (unlikely(m_parent->IsDeviceLost()))
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 108ce64..230b30b 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -88,8 +88,63 @@ namespace dxvk {
+ 
+     VkResult vr = VK_SUCCESS;
+ 
+-    if (!this->isEmpty())
+-      vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
++    if (!this->isEmpty()) {
++      if (likely(vk->vkQueueSubmit2 != nullptr)) {
++        vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
++      } else {
++        auto mapStage = [](VkPipelineStageFlags2 s, VkPipelineStageFlags fallback) -> VkPipelineStageFlags {
++          VkPipelineStageFlags out = VkPipelineStageFlags(s & 0x7FFFFFFFull);
++          if (s & (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
++                   VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT))
++            out |= VK_PIPELINE_STAGE_TRANSFER_BIT;
++          if (s & (VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT))
++            out |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
++          if (s & VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT)
++            out |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
++          return out ? out : fallback;
++        };
++
++        small_vector<VkSemaphore, 8> waitSems;
++        small_vector<VkPipelineStageFlags, 8> waitStages;
++        small_vector<uint64_t, 8> waitValues;
++        for (const auto& w : m_semaphoreWaits) {
++          waitSems.push_back(w.semaphore);
++          waitStages.push_back(mapStage(w.stageMask, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
++          waitValues.push_back(w.value);
++        }
++
++        small_vector<VkCommandBuffer, 8> cmdBufs;
++        for (const auto& cb : m_commandBuffers)
++          cmdBufs.push_back(cb.commandBuffer);
++
++        small_vector<VkSemaphore, 8> signalSems;
++        small_vector<uint64_t, 8> signalValues;
++        for (const auto& s : m_semaphoreSignals) {
++          signalSems.push_back(s.semaphore);
++          signalValues.push_back(s.value);
++        }
++
++        VkTimelineSemaphoreSubmitInfo timelineInfo = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
++        timelineInfo.waitSemaphoreValueCount = uint32_t(waitValues.size());
++        timelineInfo.pWaitSemaphoreValues = waitValues.empty() ? nullptr : waitValues.data();
++        timelineInfo.signalSemaphoreValueCount = uint32_t(signalValues.size());
++        timelineInfo.pSignalSemaphoreValues = signalValues.empty() ? nullptr : signalValues.data();
++
++        VkSubmitInfo legacySubmit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++        legacySubmit.waitSemaphoreCount = uint32_t(waitSems.size());
++        legacySubmit.pWaitSemaphores = waitSems.empty() ? nullptr : waitSems.data();
++        legacySubmit.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
++        legacySubmit.commandBufferCount = uint32_t(cmdBufs.size());
++        legacySubmit.pCommandBuffers = cmdBufs.empty() ? nullptr : cmdBufs.data();
++        legacySubmit.signalSemaphoreCount = uint32_t(signalSems.size());
++        legacySubmit.pSignalSemaphores = signalSems.empty() ? nullptr : signalSems.data();
++
++        if (!waitValues.empty() || !signalValues.empty())
++          timelineInfo.pNext = std::exchange(legacySubmit.pNext, &timelineInfo);
++
++        vr = vk->vkQueueSubmit(queue, 1, &legacySubmit, VK_NULL_HANDLE);
++      }
++    }
+ 
+     this->reset();
+     return vr;
+@@ -233,6 +288,7 @@ namespace dxvk {
+     m_vkd           (device->vkd()),
+     m_vki           (device->vki()),
+     m_checkpoints   (device->getCheckpointBuffer()) {
++    m_loadOpNone = device->features().khrLoadStoreOpNone;
+     const auto& graphicsQueue = m_device->queues().graphics;
+     const auto& transferQueue = m_device->queues().transfer;
+ 
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 38891eb..7cdea14 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -22,6 +22,16 @@
+ namespace dxvk {
+ 
+   class DxvkCheckpointBuffer;
++  class DxvkDevice;
++
++  void dxvkBeginCompatRenderPass(
++          DxvkDevice*               device,
++          VkCommandBuffer           cmdBuffer,
++    const VkRenderingInfo*          info);
++
++  void dxvkEndCompatRenderPass(
++          DxvkDevice*               device,
++          VkCommandBuffer           cmdBuffer);
+ 
+   /**
+    * \brief Immediate descriptor write
+@@ -602,7 +612,49 @@ namespace dxvk {
+ 
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+ 
+-      m_vkd->vkCmdBeginRendering(getCmdBuffer(cmdBuffer), pRenderingInfo);
++      if (unlikely(!m_loadOpNone)) {
++        /* Without VK_KHR_load_store_op_none: LOAD keeps the contents, as NONE would, at some tiler cost. */
++        VkRenderingInfo info = *pRenderingInfo;
++        std::array<VkRenderingAttachmentInfo, 16u> colors = { };
++        VkRenderingAttachmentInfo depth = { }, stencil = { };
++
++        for (uint32_t i = 0u; i < info.colorAttachmentCount && i < colors.size(); i++) {
++          colors[i] = info.pColorAttachments[i];
++
++          if (colors[i].loadOp == VK_ATTACHMENT_LOAD_OP_NONE)
++            colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++        }
++
++        info.pColorAttachments = colors.data();
++
++        if (info.pDepthAttachment) {
++          depth = *info.pDepthAttachment;
++
++          if (depth.loadOp == VK_ATTACHMENT_LOAD_OP_NONE)
++            depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++
++          info.pDepthAttachment = &depth;
++        }
++
++        if (info.pStencilAttachment) {
++          stencil = *info.pStencilAttachment;
++
++          if (stencil.loadOp == VK_ATTACHMENT_LOAD_OP_NONE)
++            stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++
++          info.pStencilAttachment = &stencil;
++        }
++
++        if (likely(m_vkd->vkCmdBeginRendering != nullptr))
++          m_vkd->vkCmdBeginRendering(getCmdBuffer(cmdBuffer), &info);
++        else
++          dxvkBeginCompatRenderPass(m_device, getCmdBuffer(cmdBuffer), &info);
++      } else {
++        if (likely(m_vkd->vkCmdBeginRendering != nullptr))
++          m_vkd->vkCmdBeginRendering(getCmdBuffer(cmdBuffer), pRenderingInfo);
++        else
++          dxvkBeginCompatRenderPass(m_device, getCmdBuffer(cmdBuffer), pRenderingInfo);
++      }
+     }
+ 
+ 
+@@ -622,7 +674,18 @@ namespace dxvk {
+     void cmdBindDescriptorSets(
+             DxvkCmdBuffer             cmdBuffer,
+       const VkBindDescriptorSetsInfo* info) {
+-      m_vkd->vkCmdBindDescriptorSets2KHR(getCmdBuffer(cmdBuffer), info);
++      if (likely(m_vkd->vkCmdBindDescriptorSets2KHR != nullptr)) {
++        m_vkd->vkCmdBindDescriptorSets2KHR(getCmdBuffer(cmdBuffer), info);
++      } else {
++        if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
++          m_vkd->vkCmdBindDescriptorSets(getCmdBuffer(cmdBuffer), VK_PIPELINE_BIND_POINT_GRAPHICS,
++            info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets,
++            info->dynamicOffsetCount, info->pDynamicOffsets);
++        if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
++          m_vkd->vkCmdBindDescriptorSets(getCmdBuffer(cmdBuffer), VK_PIPELINE_BIND_POINT_COMPUTE,
++            info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets,
++            info->dynamicOffsetCount, info->pDynamicOffsets);
++      }
+     }
+ 
+ 
+@@ -638,8 +701,13 @@ namespace dxvk {
+             VkDeviceSize            offset,
+             VkDeviceSize            size,
+             VkIndexType             indexType) {
+-      m_vkd->vkCmdBindIndexBuffer2KHR(getCmdBuffer(),
+-        buffer, offset, size, indexType);
++      if (likely(m_vkd->vkCmdBindIndexBuffer2KHR != nullptr)) {
++        m_vkd->vkCmdBindIndexBuffer2KHR(getCmdBuffer(),
++          buffer, offset, size, indexType);
++      } else if (buffer != VK_NULL_HANDLE) {
++        m_vkd->vkCmdBindIndexBuffer(getCmdBuffer(),
++          buffer, offset, indexType);
++      }
+     }
+ 
+ 
+@@ -670,9 +738,14 @@ namespace dxvk {
+       const VkDeviceSize*           pOffsets,
+       const VkDeviceSize*           pSizes,
+       const VkDeviceSize*           pStrides) {
+-      m_vkd->vkCmdBindVertexBuffers2(getCmdBuffer(),
+-        firstBinding, bindingCount, pBuffers, pOffsets,
+-        pSizes, pStrides);
++      if (likely(m_vkd->vkCmdBindVertexBuffers2 != nullptr)) {
++        m_vkd->vkCmdBindVertexBuffers2(getCmdBuffer(),
++          firstBinding, bindingCount, pBuffers, pOffsets,
++          pSizes, pStrides);
++      } else {
++        m_vkd->vkCmdBindVertexBuffers(getCmdBuffer(),
++          firstBinding, bindingCount, pBuffers, pOffsets);
++      }
+     }
+     
+     void cmdLaunchCuKernel(VkCuLaunchInfoNVX launchInfo) {
+@@ -689,7 +762,20 @@ namespace dxvk {
+ 
+       m_cmd.execCommands = true;
+ 
+-      m_vkd->vkCmdBlitImage2(getCmdBuffer(), pBlitInfo);
++      if (likely(m_vkd->vkCmdBlitImage2 != nullptr)) {
++        m_vkd->vkCmdBlitImage2(getCmdBuffer(), pBlitInfo);
++      } else {
++        std::vector<VkImageBlit> regions(pBlitInfo->regionCount);
++        for (uint32_t i = 0; i < pBlitInfo->regionCount; ++i) {
++          const auto& r = pBlitInfo->pRegions[i];
++          regions[i] = { r.srcSubresource, { r.srcOffsets[0], r.srcOffsets[1] },
++                         r.dstSubresource, { r.dstOffsets[0], r.dstOffsets[1] } };
++        }
++        m_vkd->vkCmdBlitImage(getCmdBuffer(),
++          pBlitInfo->srcImage, pBlitInfo->srcImageLayout,
++          pBlitInfo->dstImage, pBlitInfo->dstImageLayout,
++          pBlitInfo->regionCount, regions.data(), pBlitInfo->filter);
++      }
+     }
+     
+     
+@@ -750,7 +836,18 @@ namespace dxvk {
+         debugMarker(cmdBuffer, "CopyBuffer");
+ 
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+-      m_vkd->vkCmdCopyBuffer2(getCmdBuffer(cmdBuffer), copyInfo);
++      if (likely(m_vkd->vkCmdCopyBuffer2 != nullptr)) {
++        m_vkd->vkCmdCopyBuffer2(getCmdBuffer(cmdBuffer), copyInfo);
++      } else {
++        std::vector<VkBufferCopy> regions(copyInfo->regionCount);
++        for (uint32_t i = 0; i < copyInfo->regionCount; ++i) {
++          const auto& r = copyInfo->pRegions[i];
++          regions[i] = { r.srcOffset, r.dstOffset, r.size };
++        }
++        m_vkd->vkCmdCopyBuffer(getCmdBuffer(cmdBuffer),
++          copyInfo->srcBuffer, copyInfo->dstBuffer,
++          copyInfo->regionCount, regions.data());
++      }
+     }
+     
+     
+@@ -761,7 +858,19 @@ namespace dxvk {
+         debugMarker(cmdBuffer, "CopyBufferToImage");
+ 
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+-      m_vkd->vkCmdCopyBufferToImage2(getCmdBuffer(cmdBuffer), copyInfo);
++      if (likely(m_vkd->vkCmdCopyBufferToImage2 != nullptr)) {
++        m_vkd->vkCmdCopyBufferToImage2(getCmdBuffer(cmdBuffer), copyInfo);
++      } else {
++        std::vector<VkBufferImageCopy> regions(copyInfo->regionCount);
++        for (uint32_t i = 0; i < copyInfo->regionCount; ++i) {
++          const auto& r = copyInfo->pRegions[i];
++          regions[i] = { r.bufferOffset, r.bufferRowLength, r.bufferImageHeight,
++                         r.imageSubresource, r.imageOffset, r.imageExtent };
++        }
++        m_vkd->vkCmdCopyBufferToImage(getCmdBuffer(cmdBuffer),
++          copyInfo->srcBuffer, copyInfo->dstImage, copyInfo->dstImageLayout,
++          copyInfo->regionCount, regions.data());
++      }
+     }
+     
+     
+@@ -772,7 +881,20 @@ namespace dxvk {
+         debugMarker(cmdBuffer, "CopyImage");
+ 
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+-      m_vkd->vkCmdCopyImage2(getCmdBuffer(cmdBuffer), copyInfo);
++      if (likely(m_vkd->vkCmdCopyImage2 != nullptr)) {
++        m_vkd->vkCmdCopyImage2(getCmdBuffer(cmdBuffer), copyInfo);
++      } else {
++        std::vector<VkImageCopy> regions(copyInfo->regionCount);
++        for (uint32_t i = 0; i < copyInfo->regionCount; ++i) {
++          const auto& r = copyInfo->pRegions[i];
++          regions[i] = { r.srcSubresource, r.srcOffset,
++                         r.dstSubresource, r.dstOffset, r.extent };
++        }
++        m_vkd->vkCmdCopyImage(getCmdBuffer(cmdBuffer),
++          copyInfo->srcImage, copyInfo->srcImageLayout,
++          copyInfo->dstImage, copyInfo->dstImageLayout,
++          copyInfo->regionCount, regions.data());
++      }
+     }
+     
+     
+@@ -783,7 +905,19 @@ namespace dxvk {
+         debugMarker(cmdBuffer, "CopyImageToBuffer");
+ 
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+-      m_vkd->vkCmdCopyImageToBuffer2(getCmdBuffer(cmdBuffer), copyInfo);
++      if (likely(m_vkd->vkCmdCopyImageToBuffer2 != nullptr)) {
++        m_vkd->vkCmdCopyImageToBuffer2(getCmdBuffer(cmdBuffer), copyInfo);
++      } else {
++        std::vector<VkBufferImageCopy> regions(copyInfo->regionCount);
++        for (uint32_t i = 0; i < copyInfo->regionCount; ++i) {
++          const auto& r = copyInfo->pRegions[i];
++          regions[i] = { r.bufferOffset, r.bufferRowLength, r.bufferImageHeight,
++                         r.imageSubresource, r.imageOffset, r.imageExtent };
++        }
++        m_vkd->vkCmdCopyImageToBuffer(getCmdBuffer(cmdBuffer),
++          copyInfo->srcImage, copyInfo->srcImageLayout, copyInfo->dstBuffer,
++          copyInfo->regionCount, regions.data());
++      }
+     }
+ 
+ 
+@@ -978,7 +1112,10 @@ namespace dxvk {
+       if (unlikely(m_checkpoints))
+         debugMarker(cmdBuffer, "EndRendering");
+ 
+-      m_vkd->vkCmdEndRendering(getCmdBuffer(cmdBuffer));
++      if (likely(m_vkd->vkCmdEndRendering != nullptr))
++        m_vkd->vkCmdEndRendering(getCmdBuffer(cmdBuffer));
++      else
++        dxvkEndCompatRenderPass(m_device, getCmdBuffer(cmdBuffer));
+     }
+ 
+ 
+@@ -1020,14 +1157,99 @@ namespace dxvk {
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+       m_statCounters.addCtr(DxvkStatCounter::CmdBarrierCount, 1);
+ 
+-      m_vkd->vkCmdPipelineBarrier2(getCmdBuffer(cmdBuffer), dependencyInfo);
++      if (likely(m_vkd->vkCmdPipelineBarrier2 != nullptr)) {
++        m_vkd->vkCmdPipelineBarrier2(getCmdBuffer(cmdBuffer), dependencyInfo);
++        return;
++      }
++
++      auto mapStage = [](VkPipelineStageFlags2 s, VkPipelineStageFlags fallback) -> VkPipelineStageFlags {
++        VkPipelineStageFlags out = VkPipelineStageFlags(s & 0x7FFFFFFFull);
++        if (s & (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
++                 VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT))
++          out |= VK_PIPELINE_STAGE_TRANSFER_BIT;
++        if (s & (VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT))
++          out |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
++        if (s & VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT)
++          out |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
++        return out ? out : fallback;
++      };
++      auto mapAccess = [](VkAccessFlags2 a) -> VkAccessFlags {
++        VkAccessFlags out = VkAccessFlags(a & 0x01FFFFFFull);
++        if (a & (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT))
++          out |= VK_ACCESS_SHADER_READ_BIT;
++        if (a & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
++          out |= VK_ACCESS_SHADER_WRITE_BIT;
++        return out;
++      };
++
++      VkPipelineStageFlags srcStage = 0;
++      VkPipelineStageFlags dstStage = 0;
++
++      small_vector<VkMemoryBarrier, 4> memBarriers;
++      for (uint32_t i = 0; i < dependencyInfo->memoryBarrierCount; i++) {
++        const auto& b = dependencyInfo->pMemoryBarriers[i];
++        srcStage |= mapStage(b.srcStageMask, 0);
++        dstStage |= mapStage(b.dstStageMask, 0);
++        VkMemoryBarrier& mb = memBarriers.emplace_back();
++        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++        mb.pNext = nullptr;
++        mb.srcAccessMask = mapAccess(b.srcAccessMask);
++        mb.dstAccessMask = mapAccess(b.dstAccessMask);
++      }
++
++      small_vector<VkBufferMemoryBarrier, 8> bufBarriers;
++      for (uint32_t i = 0; i < dependencyInfo->bufferMemoryBarrierCount; i++) {
++        const auto& b = dependencyInfo->pBufferMemoryBarriers[i];
++        srcStage |= mapStage(b.srcStageMask, 0);
++        dstStage |= mapStage(b.dstStageMask, 0);
++        VkBufferMemoryBarrier& bb = bufBarriers.emplace_back();
++        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++        bb.pNext = nullptr;
++        bb.srcAccessMask = mapAccess(b.srcAccessMask);
++        bb.dstAccessMask = mapAccess(b.dstAccessMask);
++        bb.srcQueueFamilyIndex = b.srcQueueFamilyIndex;
++        bb.dstQueueFamilyIndex = b.dstQueueFamilyIndex;
++        bb.buffer = b.buffer;
++        bb.offset = b.offset;
++        bb.size = b.size;
++      }
++
++      small_vector<VkImageMemoryBarrier, 8> imgBarriers;
++      for (uint32_t i = 0; i < dependencyInfo->imageMemoryBarrierCount; i++) {
++        const auto& b = dependencyInfo->pImageMemoryBarriers[i];
++        srcStage |= mapStage(b.srcStageMask, 0);
++        dstStage |= mapStage(b.dstStageMask, 0);
++        VkImageMemoryBarrier& ib = imgBarriers.emplace_back();
++        ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++        ib.pNext = nullptr;
++        ib.srcAccessMask = mapAccess(b.srcAccessMask);
++        ib.dstAccessMask = mapAccess(b.dstAccessMask);
++        ib.oldLayout = b.oldLayout;
++        ib.newLayout = b.newLayout;
++        ib.srcQueueFamilyIndex = b.srcQueueFamilyIndex;
++        ib.dstQueueFamilyIndex = b.dstQueueFamilyIndex;
++        ib.image = b.image;
++        ib.subresourceRange = b.subresourceRange;
++      }
++
++      if (!srcStage) srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++      if (!dstStage) dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++
++      m_vkd->vkCmdPipelineBarrier(getCmdBuffer(cmdBuffer),
++        srcStage, dstStage, dependencyInfo->dependencyFlags,
++        uint32_t(memBarriers.size()), memBarriers.data(),
++        uint32_t(bufBarriers.size()), bufBarriers.data(),
++        uint32_t(imgBarriers.size()), imgBarriers.data());
+     }
+ 
+ 
+     void cmdPushConstants(
+             DxvkCmdBuffer           cmdBuffer,
+       const VkPushConstantsInfo*    info) {
+-      m_vkd->vkCmdPushConstants2KHR(getCmdBuffer(cmdBuffer), info);
++      if (likely(m_vkd->vkCmdPushConstants2KHR != nullptr))
++        m_vkd->vkCmdPushConstants2KHR(getCmdBuffer(cmdBuffer), info);
++      else
++        m_vkd->vkCmdPushConstants(getCmdBuffer(cmdBuffer), info->layout, info->stageFlags, info->offset, info->size, info->pValues);
+     }
+ 
+ 
+@@ -1057,7 +1279,20 @@ namespace dxvk {
+ 
+       m_cmd.execCommands = true;
+ 
+-      m_vkd->vkCmdResolveImage2(getCmdBuffer(), resolveInfo);
++      if (likely(m_vkd->vkCmdResolveImage2 != nullptr)) {
++        m_vkd->vkCmdResolveImage2(getCmdBuffer(), resolveInfo);
++      } else {
++        std::vector<VkImageResolve> regions(resolveInfo->regionCount);
++        for (uint32_t i = 0; i < resolveInfo->regionCount; ++i) {
++          const auto& r = resolveInfo->pRegions[i];
++          regions[i] = { r.srcSubresource, r.srcOffset,
++                         r.dstSubresource, r.dstOffset, r.extent };
++        }
++        m_vkd->vkCmdResolveImage(getCmdBuffer(),
++          resolveInfo->srcImage, resolveInfo->srcImageLayout,
++          resolveInfo->dstImage, resolveInfo->dstImageLayout,
++          resolveInfo->regionCount, regions.data());
++      }
+     }
+     
+     
+@@ -1100,9 +1335,11 @@ namespace dxvk {
+             float                   depthBiasSlopeFactor) {
+       auto cmdBuffer = getCmdBuffer();
+ 
+-      m_vkd->vkCmdSetDepthBiasEnable(cmdBuffer,
+-        depthBiasConstantFactor != 0.0f ||
+-        depthBiasSlopeFactor != 0.0f);
++      if (likely(m_vkd->vkCmdSetDepthBiasEnable != nullptr)) {
++        m_vkd->vkCmdSetDepthBiasEnable(cmdBuffer,
++          depthBiasConstantFactor != 0.0f ||
++          depthBiasSlopeFactor != 0.0f);
++      }
+ 
+       m_vkd->vkCmdSetDepthBias(cmdBuffer,
+         depthBiasConstantFactor,
+@@ -1115,9 +1352,11 @@ namespace dxvk {
+       const VkDepthBiasInfoEXT*     depthBiasInfo) {
+       auto cmdBuffer = getCmdBuffer();
+ 
+-      m_vkd->vkCmdSetDepthBiasEnable(cmdBuffer,
+-        depthBiasInfo->depthBiasConstantFactor != 0.0f ||
+-        depthBiasInfo->depthBiasSlopeFactor != 0.0f);
++      if (likely(m_vkd->vkCmdSetDepthBiasEnable != nullptr)) {
++        m_vkd->vkCmdSetDepthBiasEnable(cmdBuffer,
++          depthBiasInfo->depthBiasConstantFactor != 0.0f ||
++          depthBiasInfo->depthBiasSlopeFactor != 0.0f);
++      }
+ 
+       m_vkd->vkCmdSetDepthBias2EXT(cmdBuffer, depthBiasInfo);
+     }
+@@ -1128,8 +1367,10 @@ namespace dxvk {
+             float                   maxDepthBounds) {
+       auto cmdBuffer = getCmdBuffer();
+ 
+-      m_vkd->vkCmdSetDepthBoundsTestEnable(cmdBuffer,
+-        minDepthBounds > 0.0f || maxDepthBounds < 1.0f);
++      if (likely(m_vkd->vkCmdSetDepthBoundsTestEnable != nullptr)) {
++        m_vkd->vkCmdSetDepthBoundsTestEnable(cmdBuffer,
++          minDepthBounds > 0.0f || maxDepthBounds < 1.0f);
++      }
+ 
+       m_vkd->vkCmdSetDepthBounds(cmdBuffer,
+         minDepthBounds, maxDepthBounds);
+@@ -1138,19 +1379,22 @@ namespace dxvk {
+ 
+     void cmdSetDepthTest(
+             VkBool32                depthTestEnable) {
+-      m_vkd->vkCmdSetDepthTestEnable(getCmdBuffer(), depthTestEnable);
++      if (likely(m_vkd->vkCmdSetDepthTestEnable != nullptr))
++        m_vkd->vkCmdSetDepthTestEnable(getCmdBuffer(), depthTestEnable);
+     }
+ 
+ 
+     void cmdSetDepthWrite(
+             VkBool32                depthWriteEnable) {
+-      m_vkd->vkCmdSetDepthWriteEnable(getCmdBuffer(), depthWriteEnable);
++      if (likely(m_vkd->vkCmdSetDepthWriteEnable != nullptr))
++        m_vkd->vkCmdSetDepthWriteEnable(getCmdBuffer(), depthWriteEnable);
+     }
+ 
+ 
+     void cmdSetDepthCompareOp(
+             VkCompareOp             depthCompareOp) {
+-      m_vkd->vkCmdSetDepthCompareOp(getCmdBuffer(), depthCompareOp);
++      if (likely(m_vkd->vkCmdSetDepthCompareOp != nullptr))
++        m_vkd->vkCmdSetDepthCompareOp(getCmdBuffer(), depthCompareOp);
+     }
+ 
+ 
+@@ -1159,7 +1403,20 @@ namespace dxvk {
+       const VkDependencyInfo*       dependencyInfo) {
+       m_cmd.execCommands = true;
+ 
+-      m_vkd->vkCmdSetEvent2(getCmdBuffer(), event, dependencyInfo);
++      if (likely(m_vkd->vkCmdSetEvent2 != nullptr)) {
++        m_vkd->vkCmdSetEvent2(getCmdBuffer(), event, dependencyInfo);
++      } else {
++        VkPipelineStageFlags stageMask = 0;
++        for (uint32_t i = 0; i < dependencyInfo->memoryBarrierCount; ++i)
++          stageMask |= VkPipelineStageFlags(dependencyInfo->pMemoryBarriers[i].srcStageMask);
++        for (uint32_t i = 0; i < dependencyInfo->bufferMemoryBarrierCount; ++i)
++          stageMask |= VkPipelineStageFlags(dependencyInfo->pBufferMemoryBarriers[i].srcStageMask);
++        for (uint32_t i = 0; i < dependencyInfo->imageMemoryBarrierCount; ++i)
++          stageMask |= VkPipelineStageFlags(dependencyInfo->pImageMemoryBarriers[i].srcStageMask);
++        if (!stageMask)
++          stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++        m_vkd->vkCmdSetEvent(getCmdBuffer(), event, stageMask);
++      }
+     }
+ 
+ 
+@@ -1178,8 +1435,10 @@ namespace dxvk {
+             VkFrontFace             frontFace) {
+       VkCommandBuffer cmdBuffer = getCmdBuffer();
+ 
+-      m_vkd->vkCmdSetCullMode(cmdBuffer, cullMode);
+-      m_vkd->vkCmdSetFrontFace(cmdBuffer, frontFace);
++      if (likely(m_vkd->vkCmdSetCullMode != nullptr))
++        m_vkd->vkCmdSetCullMode(cmdBuffer, cullMode);
++      if (likely(m_vkd->vkCmdSetFrontFace != nullptr))
++        m_vkd->vkCmdSetFrontFace(cmdBuffer, frontFace);
+     }
+ 
+     
+@@ -1197,21 +1456,27 @@ namespace dxvk {
+     void cmdSetScissor(
+             uint32_t                scissorCount,
+       const VkRect2D*               scissors) {
+-      m_vkd->vkCmdSetScissorWithCount(getCmdBuffer(), scissorCount, scissors);
++      if (likely(m_vkd->vkCmdSetScissorWithCount != nullptr))
++        m_vkd->vkCmdSetScissorWithCount(getCmdBuffer(), scissorCount, scissors);
++      else if (scissorCount)
++        m_vkd->vkCmdSetScissor(getCmdBuffer(), 0, scissorCount, scissors);
+     }
+ 
+ 
+     void cmdSetStencilTest(
+             VkBool32                enableStencilTest) {
+-      m_vkd->vkCmdSetStencilTestEnable(getCmdBuffer(), enableStencilTest);
++      if (likely(m_vkd->vkCmdSetStencilTestEnable != nullptr))
++        m_vkd->vkCmdSetStencilTestEnable(getCmdBuffer(), enableStencilTest);
+     }
+ 
+ 
+     void cmdSetStencilOp(
+             VkStencilFaceFlags      faceMask,
+       const VkStencilOpState&       op) {
+-      m_vkd->vkCmdSetStencilOp(getCmdBuffer(), faceMask,
+-        op.failOp, op.passOp, op.depthFailOp, op.compareOp);
++      if (likely(m_vkd->vkCmdSetStencilOp != nullptr)) {
++        m_vkd->vkCmdSetStencilOp(getCmdBuffer(), faceMask,
++          op.failOp, op.passOp, op.depthFailOp, op.compareOp);
++      }
+     }
+ 
+ 
+@@ -1240,7 +1505,10 @@ namespace dxvk {
+     void cmdSetViewport(
+             uint32_t                viewportCount,
+       const VkViewport*             viewports) {
+-      m_vkd->vkCmdSetViewportWithCount(getCmdBuffer(), viewportCount, viewports);
++      if (likely(m_vkd->vkCmdSetViewportWithCount != nullptr))
++        m_vkd->vkCmdSetViewportWithCount(getCmdBuffer(), viewportCount, viewports);
++      else if (viewportCount)
++        m_vkd->vkCmdSetViewport(getCmdBuffer(), 0, viewportCount, viewports);
+     }
+ 
+ 
+@@ -1251,8 +1519,16 @@ namespace dxvk {
+             uint32_t                query) {
+       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+ 
+-      m_vkd->vkCmdWriteTimestamp2(getCmdBuffer(cmdBuffer),
+-        pipelineStage, queryPool, query);
++      if (likely(m_vkd->vkCmdWriteTimestamp2 != nullptr)) {
++        m_vkd->vkCmdWriteTimestamp2(getCmdBuffer(cmdBuffer),
++          pipelineStage, queryPool, query);
++      } else {
++        VkPipelineStageFlagBits stage = VkPipelineStageFlagBits(pipelineStage & 0xFFFFFFFFull);
++        if (!stage)
++          stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++        m_vkd->vkCmdWriteTimestamp(getCmdBuffer(cmdBuffer),
++          stage, queryPool, query);
++      }
+     }
+     
+ 
+@@ -1288,8 +1564,13 @@ namespace dxvk {
+     void resetQuery(
+             VkQueryPool             queryPool,
+             uint32_t                queryId) {
+-      m_vkd->vkResetQueryPool(
+-        m_vkd->device(), queryPool, queryId, 1);
++      if (likely(m_vkd->vkResetQueryPool != nullptr)) {
++        m_vkd->vkResetQueryPool(
++          m_vkd->device(), queryPool, queryId, 1);
++      } else {
++        m_vkd->vkCmdResetQueryPool(
++          getCmdBuffer(DxvkCmdBuffer::InitBuffer), queryPool, queryId, 1);
++      }
+     }
+ 
+ 
+@@ -1355,6 +1636,7 @@ namespace dxvk {
+   private:
+     
+     DxvkDevice*               m_device;
++    bool                      m_loadOpNone = true;
+     Rc<vk::DeviceFn>          m_vkd;
+     Rc<vk::InstanceFn>        m_vki;
+ 
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 7c6a4c8..7b8e605 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -2824,6 +2824,14 @@ namespace dxvk {
+     if (m_state.dyn.depthBias != depthBias) {
+       m_state.dyn.depthBias = depthBias;
+       m_flags.set(DxvkContextFlag::GpDirtyDepthBias);
++
++      if (!m_device->features().vk13.dynamicRendering) {
++        uint8_t dbEnable = (depthBias.depthBiasConstant != 0.0f || depthBias.depthBiasSlope != 0.0f) ? 1u : 0u;
++        if (m_state.gp.state.compat.depthBiasEnable != dbEnable) {
++          m_state.gp.state.compat.depthBiasEnable = dbEnable;
++          m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
++        }
++      }
+     }
+   }
+ 
+@@ -2842,6 +2850,14 @@ namespace dxvk {
+     if (m_state.dyn.depthBounds != depthBounds) {
+       m_state.dyn.depthBounds = depthBounds;
+       m_flags.set(DxvkContextFlag::GpDirtyDepthBounds);
++
++      if (!m_device->features().vk13.dynamicRendering) {
++        uint8_t dbtEnable = (depthBounds.minDepthBounds > 0.0f || depthBounds.maxDepthBounds < 1.0f) ? 1u : 0u;
++        if (m_state.gp.state.compat.depthBoundsTestEnable != dbtEnable) {
++          m_state.gp.state.compat.depthBoundsTestEnable = dbtEnable;
++          m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
++        }
++      }
+     }
+   }
+   
+@@ -2941,6 +2957,12 @@ namespace dxvk {
+       m_state.dyn.frontFace = frontFace;
+ 
+       m_flags.set(DxvkContextFlag::GpDirtyRasterizerState);
++
++      if (!m_device->features().vk13.dynamicRendering) {
++        m_state.gp.state.compat.cullMode = uint8_t(cullMode);
++        m_state.gp.state.compat.frontFace = uint8_t(frontFace);
++        m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
++      }
+     }
+ 
+     if (unlikely(rs.sampleCount() != m_state.gp.state.rs.sampleCount())) {
+@@ -2993,6 +3015,39 @@ namespace dxvk {
+       m_flags.set(DxvkContextFlag::GpDirtyStencilTest);
+ 
+     m_state.dyn.depthStencilState = ds;
++
++    if (!m_device->features().vk13.dynamicRendering) {
++      auto& c = m_state.gp.state.compat;
++      auto copyStencil = [](DxvkGraphicsPipelineStateInfo::CompatStencilOp& dst, const DxvkStencilOp& src) {
++        bool changed = dst.failOp != uint8_t(src.failOp())
++                    || dst.passOp != uint8_t(src.passOp())
++                    || dst.depthFailOp != uint8_t(src.depthFailOp())
++                    || dst.compareOp != uint8_t(src.compareOp())
++                    || dst.compareMask != src.compareMask()
++                    || dst.writeMask != src.writeMask();
++        if (changed) {
++          dst.failOp = uint8_t(src.failOp());
++          dst.passOp = uint8_t(src.passOp());
++          dst.depthFailOp = uint8_t(src.depthFailOp());
++          dst.compareOp = uint8_t(src.compareOp());
++          dst.compareMask = src.compareMask();
++          dst.writeMask = src.writeMask();
++        }
++        return changed;
++      };
++      bool changed = c.depthTest != uint8_t(ds.depthTest())
++                  || c.depthWrite != uint8_t(ds.depthWrite())
++                  || c.stencilTest != uint8_t(ds.stencilTest())
++                  || c.depthCompareOp != uint8_t(ds.depthCompareOp());
++      c.depthTest = uint8_t(ds.depthTest());
++      c.depthWrite = uint8_t(ds.depthWrite());
++      c.stencilTest = uint8_t(ds.stencilTest());
++      c.depthCompareOp = uint8_t(ds.depthCompareOp());
++      changed |= copyStencil(c.front, ds.stencilOpFront());
++      changed |= copyStencil(c.back, ds.stencilOpBack());
++      if (changed)
++        m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
++    }
+   }
+   
+   
+@@ -6549,7 +6604,8 @@ namespace dxvk {
+ 
+     // Some hardware will not work properly if we don't trim the render area,
+     // so unconditionally use secondary command buffers on all tiler setups.
+-    bool useSecondaryCmdBuffer = m_device->perfHints().preferRenderPassOps;
++    bool useSecondaryCmdBuffer = m_device->perfHints().preferRenderPassOps
++      && m_device->features().vk13.dynamicRendering;
+ 
+     if (useSecondaryCmdBuffer) {
+       // Begin secondary command buffer on tiling GPUs so that subsequent
+@@ -7838,7 +7894,7 @@ namespace dxvk {
+     std::array<VkDeviceSize, MaxNumVertexBindings> strides;
+     
+     bool oldDynamicStrides = m_flags.test(DxvkContextFlag::GpDynamicVertexStrides);
+-    bool newDynamicStrides = true;
++    bool newDynamicStrides = m_device->features().vk13.dynamicRendering;
+ 
+     // Set buffer handles and offsets for active bindings
+     for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
+@@ -8289,8 +8345,9 @@ namespace dxvk {
+ 
+     // End render pass if there are pending resolves
+     if (m_flags.any(DxvkContextFlag::GpDirtyRenderTargets,
+-                    DxvkContextFlag::GpRenderPassNeedsFlush))
++                    DxvkContextFlag::GpRenderPassNeedsFlush)) {
+       this->updateRenderTargets();
++    }
+ 
+     if (m_flags.test(DxvkContextFlag::GpXfbActive)) {
+       // If transform feedback is active and there is a chance that we might
+diff --git a/src/dxvk/dxvk_device.cpp b/src/dxvk/dxvk_device.cpp
+index 0221825..d895b38 100644
+--- a/src/dxvk/dxvk_device.cpp
++++ b/src/dxvk/dxvk_device.cpp
+@@ -1,3 +1,10 @@
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++#include <vector>
++#include <sys/stat.h>
++
+ #include "dxvk_device.h"
+ #include "dxvk_instance.h"
+ #include "dxvk_latency_builtin.h"
+@@ -26,6 +33,35 @@ namespace dxvk {
+     m_objects           (this),
+     m_checkpoints       (this),
+     m_submissionQueue   (this, queueCallback) {
++    /* Android: without graphics pipeline libraries each new pipeline is compiled while the game waits.
++       The driver's own cache, kept on disk, makes the same pipelines cheap on later runs. */
++    if (const char* path = std::getenv("ME_PC_PIPELINE_CACHE")) {
++      std::vector<char> data;
++
++      if (FILE* f = std::fopen(path, "rb")) {
++        std::fseek(f, 0, SEEK_END);
++        long size = std::ftell(f);
++        std::fseek(f, 0, SEEK_SET);
++        data.resize(size > 0 ? size_t(size) : 0u);
++        if (!data.empty() && std::fread(data.data(), 1, data.size(), f) != data.size())
++          data.clear();
++        std::fclose(f);
++      }
++
++      VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
++      info.initialDataSize = data.size();
++      info.pInitialData = data.empty() ? nullptr : data.data();
++
++      if (m_vkd->vkCreatePipelineCache(m_vkd->device(), &info, nullptr, &m_pipelineCache) != VK_SUCCESS) {
++        /* The driver may refuse old data: start with an empty cache. */
++        info.initialDataSize = 0u;
++        info.pInitialData = nullptr;
++        if (m_vkd->vkCreatePipelineCache(m_vkd->device(), &info, nullptr, &m_pipelineCache) != VK_SUCCESS)
++          m_pipelineCache = VK_NULL_HANDLE;
++      }
++
++      Logger::info(str::format("Pipeline cache: ", path, ", ", data.size(), " bytes loaded"));
++    }
+ 
+     if (adapter->kmtLocal()) {
+       D3DKMT_CREATEDEVICE create = { };
+@@ -45,6 +81,50 @@ namespace dxvk {
+   }
+   
+   
++  void DxvkDevice::pipelineCompiled() {
++    if (!m_pipelineCache)
++      return;
++
++    m_pipelineCacheDirty.store(true);
++
++    if (m_pipelineCacheBusy.exchange(true))
++      return;
++
++    /* One thread for the life of the process: a compile must not also wait for the file, compiles come
++       in bursts, and the process may end at any time, so the file is replaced only when complete. */
++    std::thread([this] {
++      for (;;) {
++        std::this_thread::sleep_for(std::chrono::seconds(10));
++
++        if (!m_pipelineCacheDirty.exchange(false))
++          continue;
++
++        size_t size = 0u;
++        std::vector<char> data;
++
++        if (m_vkd->vkGetPipelineCacheData(m_vkd->device(), m_pipelineCache, &size, nullptr) != VK_SUCCESS || !size)
++          continue;
++
++        data.resize(size);
++
++        if (m_vkd->vkGetPipelineCacheData(m_vkd->device(), m_pipelineCache, &size, data.data()) != VK_SUCCESS)
++          continue;
++
++        std::string path = std::getenv("ME_PC_PIPELINE_CACHE");
++        std::string temp = path + ".tmp";
++
++        if (FILE* f = std::fopen(temp.c_str(), "wb")) {
++          bool ok = std::fwrite(data.data(), 1, size, f) == size;
++          ok = (std::fclose(f) == 0) && ok;
++
++          if (ok)
++            std::rename(temp.c_str(), path.c_str());
++        }
++      }
++    }).detach();
++  }
++
++
+   DxvkDevice::~DxvkDevice() {
+     if (m_kmtLocal) {
+       D3DKMT_DESTROYDEVICE destroy = { };
+@@ -66,6 +146,11 @@ namespace dxvk {
+     // Stop workers explicitly in order to prevent
+     // access to structures that are being destroyed.
+     m_objects.pipelineManager().stopWorkerThreads();
++
++    for (auto& fb : m_compatFramebuffers)
++      m_vkd->vkDestroyFramebuffer(m_vkd->device(), fb.second, nullptr);
++    for (auto& rp : m_compatRenderPasses)
++      m_vkd->vkDestroyRenderPass(m_vkd->device(), rp.second, nullptr);
+   }
+ 
+ 
+@@ -316,11 +401,23 @@ namespace dxvk {
+     stageInfo.pName = "main";
+     stageInfo.pSpecializationInfo = stage.spec;
+ 
++    VkShaderModule shaderModule = VK_NULL_HANDLE;
++    if (!(m_features.khrMaintenance5.maintenance5 || m_features.extGraphicsPipelineLibrary.graphicsPipelineLibrary)) {
++      VkResult modVr = m_vkd->vkCreateShaderModule(m_vkd->device(), &moduleInfo, nullptr, &shaderModule);
++      if (modVr)
++        throw DxvkError(str::format("Failed to create built-in compute shader module: ", modVr));
++      stageInfo.pNext = nullptr;
++      stageInfo.module = shaderModule;
++    }
++
+     VkPipeline pipeline = VK_NULL_HANDLE;
+ 
+     VkResult vr = m_vkd->vkCreateComputePipelines(m_vkd->device(),
+       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+ 
++    if (shaderModule)
++      m_vkd->vkDestroyShaderModule(m_vkd->device(), shaderModule, nullptr);
++
+     if (vr)
+       throw DxvkError(str::format("Failed to create built-in compute pipeline: ", vr));
+ 
+@@ -355,14 +452,30 @@ namespace dxvk {
+     }
+ 
+     small_vector<VkPipelineShaderStageCreateInfo, MaxStages> stageInfos;
++    small_vector<VkShaderModule, MaxStages> shaderModules;
++    const bool useInlinedModule = m_features.khrMaintenance5.maintenance5 ||
++                                  m_features.extGraphicsPipelineLibrary.graphicsPipelineLibrary;
+ 
+     for (size_t i = 0; i < stages.size(); i++) {
+       auto& info = stageInfos.emplace_back();
+       info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-      info.pNext = &moduleInfos[i];
+       info.stage = stages[i].first;
+       info.pName = "main";
+       info.pSpecializationInfo = stages[i].second.spec;
++
++      if (useInlinedModule) {
++        info.pNext = &moduleInfos[i];
++      } else {
++        VkShaderModule mod = VK_NULL_HANDLE;
++        VkResult modVr = m_vkd->vkCreateShaderModule(m_vkd->device(), &moduleInfos[i], nullptr, &mod);
++        if (modVr) {
++          for (VkShaderModule m : shaderModules)
++            m_vkd->vkDestroyShaderModule(m_vkd->device(), m, nullptr);
++          throw DxvkError(str::format("Failed to create built-in graphics shader module: ", modVr));
++        }
++        shaderModules.push_back(mod);
++        info.module = mod;
++      }
+     }
+ 
+     // Attachment format infos, useful to set up state
+@@ -385,6 +498,10 @@ namespace dxvk {
+ 
+     // Default viewport state, needs to be defined even if everything is dynamic
+     VkPipelineViewportStateCreateInfo vpState = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    if (!m_features.vk13.dynamicRendering) {
++      vpState.viewportCount = 1u;
++      vpState.scissorCount  = 1u;
++    }
+ 
+     // Default rasterization state
+     VkPipelineRasterizationStateCreateInfo rsState = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+@@ -440,8 +557,13 @@ namespace dxvk {
+ 
+     // Prepare dynamic states
+     small_vector<VkDynamicState, 4> dynamicStates;
+-    dynamicStates.push_back(VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT);
+-    dynamicStates.push_back(VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT);
++    if (m_features.vk13.dynamicRendering) {
++      dynamicStates.push_back(VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT);
++      dynamicStates.push_back(VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT);
++    } else {
++      dynamicStates.push_back(VK_DYNAMIC_STATE_VIEWPORT);
++      dynamicStates.push_back(VK_DYNAMIC_STATE_SCISSOR);
++    }
+ 
+     for (uint32_t i = 0; i < state.dynamicStateCount; i++)
+       dynamicStates.push_back(state.dynamicStates[i]);
+@@ -472,7 +594,11 @@ namespace dxvk {
+     if (canUseDescriptorBuffer())
+       pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+ 
+-    VkGraphicsPipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &renderingInfo };
++    VkGraphicsPipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    if (m_features.vk13.dynamicRendering)
++      pipelineInfo.pNext = &renderingInfo;
++    else
++      pipelineInfo.renderPass = getCompatPipelineRenderPass(renderingInfo);
+     pipelineInfo.stageCount = stageInfos.size();
+     pipelineInfo.pStages = stageInfos.data();
+     pipelineInfo.pVertexInputState = state.viState ? state.viState : &viState;
+@@ -494,6 +620,9 @@ namespace dxvk {
+     VkResult vr = m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
+       VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+ 
++    for (VkShaderModule m : shaderModules)
++      m_vkd->vkDestroyShaderModule(m_vkd->device(), m, nullptr);
++
+     if (vr)
+       throw DxvkError(str::format("Failed to create built-in graphics pipeline: ", vr));
+ 
+@@ -735,7 +864,7 @@ namespace dxvk {
+                   || m_adapter->matchesDriver(VK_DRIVER_ID_MESA_KOSMICKRISP);
+ 
+     applyTristate(tilerMode, m_options.tilerMode);
+-    hints.preferRenderPassOps = tilerMode;
++    hints.preferRenderPassOps = tilerMode && m_features.vk13.dynamicRendering;
+     hints.preferCachedMemory = tilerMode;
+ 
+     // Compute-based mip generation has some potential for performance
+@@ -910,4 +1039,322 @@ namespace dxvk {
+     Logger::info(str::format("Binding model: ", descriptorModel));
+   }
+ 
++
++  void DxvkDevice::registerCompatImageView(VkImageView view, VkFormat format) {
++    if (!view)
++      return;
++    std::lock_guard<std::mutex> lock(m_compatMutex);
++    m_compatViewFormats[uint64_t(view)] = format;
++  }
++
++
++  void DxvkDevice::unregisterCompatImageView(VkImageView view) {
++    if (!view)
++      return;
++    std::lock_guard<std::mutex> lock(m_compatMutex);
++    uint64_t key = uint64_t(view);
++    m_compatViewFormats.erase(key);
++    auto it = m_compatViewToFbs.find(key);
++    if (it != m_compatViewToFbs.end()) {
++      for (const auto& fbKey : it->second) {
++        auto fbIt = m_compatFramebuffers.find(fbKey);
++        if (fbIt != m_compatFramebuffers.end()) {
++          m_vkd->vkDestroyFramebuffer(m_vkd->device(), fbIt->second, nullptr);
++          m_compatFramebuffers.erase(fbIt);
++        }
++      }
++      m_compatViewToFbs.erase(it);
++    }
++  }
++
++
++  VkRenderPass DxvkDevice::getCompatPipelineRenderPass(const VkPipelineRenderingCreateInfo& rtInfo) {
++    std::vector<uint32_t> rpKey;
++    rpKey.push_back(rtInfo.colorAttachmentCount);
++    for (uint32_t i = 0; i < rtInfo.colorAttachmentCount; ++i) {
++      VkFormat fmt = rtInfo.pColorAttachmentFormats ? rtInfo.pColorAttachmentFormats[i] : VK_FORMAT_UNDEFINED;
++      rpKey.push_back(uint32_t(fmt));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_LOAD_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_STORE_OP_STORE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_LOAD_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_STORE_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL));
++    }
++    VkFormat depthFmt = rtInfo.depthAttachmentFormat != VK_FORMAT_UNDEFINED
++      ? rtInfo.depthAttachmentFormat : rtInfo.stencilAttachmentFormat;
++    rpKey.push_back(uint32_t(depthFmt));
++    if (depthFmt != VK_FORMAT_UNDEFINED) {
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_LOAD_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_STORE_OP_STORE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_LOAD_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_STORE_OP_STORE));
++      rpKey.push_back(uint32_t(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
++    }
++
++    std::lock_guard<std::mutex> lock(m_compatMutex);
++    auto it = m_compatRenderPasses.find(rpKey);
++    if (it != m_compatRenderPasses.end())
++      return it->second;
++
++    std::vector<VkAttachmentDescription> atts;
++    std::vector<VkAttachmentReference> colorRefs;
++    for (uint32_t i = 0; i < rtInfo.colorAttachmentCount; ++i) {
++      VkFormat fmt = rtInfo.pColorAttachmentFormats ? rtInfo.pColorAttachmentFormats[i] : VK_FORMAT_UNDEFINED;
++      if (fmt == VK_FORMAT_UNDEFINED) {
++        colorRefs.push_back({ VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED });
++        continue;
++      }
++      VkAttachmentDescription d = {};
++      d.format = fmt;
++      d.samples = VK_SAMPLE_COUNT_1_BIT;
++      d.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      d.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      d.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      d.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++      d.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      d.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      colorRefs.push_back({ uint32_t(atts.size()), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
++      atts.push_back(d);
++    }
++
++    VkAttachmentReference depthRef = { VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED };
++    if (depthFmt != VK_FORMAT_UNDEFINED) {
++      VkAttachmentDescription d = {};
++      d.format = depthFmt;
++      d.samples = VK_SAMPLE_COUNT_1_BIT;
++      d.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      d.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      d.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      d.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
++      d.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++      d.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++      depthRef = { uint32_t(atts.size()), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
++      atts.push_back(d);
++    }
++
++    VkSubpassDescription subpass = {};
++    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    subpass.colorAttachmentCount = uint32_t(colorRefs.size());
++    subpass.pColorAttachments = colorRefs.empty() ? nullptr : colorRefs.data();
++    subpass.pDepthStencilAttachment = (depthFmt != VK_FORMAT_UNDEFINED) ? &depthRef : nullptr;
++
++    VkRenderPassCreateInfo rpInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++    rpInfo.attachmentCount = uint32_t(atts.size());
++    rpInfo.pAttachments = atts.empty() ? nullptr : atts.data();
++    rpInfo.subpassCount = 1;
++    rpInfo.pSubpasses = &subpass;
++
++    VkRenderPass rp = VK_NULL_HANDLE;
++    if (m_vkd->vkCreateRenderPass(m_vkd->device(), &rpInfo, nullptr, &rp) != VK_SUCCESS)
++      throw DxvkError("Failed to create compat pipeline VkRenderPass");
++    m_compatRenderPasses.emplace(std::move(rpKey), rp);
++    return rp;
++  }
++
++
++  void DxvkDevice::beginCompatRenderPass(VkCommandBuffer cmdBuffer, const VkRenderingInfo* info) {
++    std::lock_guard<std::mutex> lock(m_compatMutex);
++
++    auto getFmt = [&](VkImageView v) -> VkFormat {
++      auto it = m_compatViewFormats.find(uint64_t(v));
++      return (it != m_compatViewFormats.end()) ? it->second : VK_FORMAT_UNDEFINED;
++    };
++
++    std::vector<uint32_t> rpKey;
++    std::vector<VkAttachmentDescription> atts;
++    std::vector<VkAttachmentReference> colorRefs;
++    std::vector<VkImageView> fbViews;
++    std::vector<VkClearValue> clears;
++
++    auto sanitizeLoad = [&](VkAttachmentLoadOp op) -> VkAttachmentLoadOp {
++      return (!m_features.khrLoadStoreOpNone && op == VK_ATTACHMENT_LOAD_OP_NONE)
++        ? VK_ATTACHMENT_LOAD_OP_LOAD : op;
++    };
++    auto sanitizeStore = [&](VkAttachmentStoreOp op) -> VkAttachmentStoreOp {
++      return (!m_features.khrLoadStoreOpNone && op == VK_ATTACHMENT_STORE_OP_NONE)
++        ? VK_ATTACHMENT_STORE_OP_STORE : op;
++    };
++
++    auto sanitizeLayout = [&](VkImageLayout l, bool isDepth) -> VkImageLayout {
++      if (uint32_t(l) >= 1000000000u) {
++        Logger::err(str::format("beginCompatRenderPass: ext imageLayout=", uint32_t(l), " isDepth=", isDepth));
++        if (l == VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL)
++          return isDepth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        if (l == VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL)
++          return isDepth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++      }
++      return l;
++    };
++
++    rpKey.push_back(info->colorAttachmentCount);
++    for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
++      const auto& ca = info->pColorAttachments[i];
++      VkFormat fmt = ca.imageView ? getFmt(ca.imageView) : VK_FORMAT_UNDEFINED;
++      VkAttachmentLoadOp cLoad = sanitizeLoad(ca.loadOp);
++      VkAttachmentStoreOp cStore = sanitizeStore(ca.storeOp);
++      VkImageLayout cLayout = sanitizeLayout(ca.imageLayout, false);
++      rpKey.push_back(uint32_t(fmt));
++      rpKey.push_back(uint32_t(cLoad));
++      rpKey.push_back(uint32_t(cStore));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_LOAD_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(VK_ATTACHMENT_STORE_OP_DONT_CARE));
++      rpKey.push_back(uint32_t(cLayout));
++      if (ca.imageView && fmt != VK_FORMAT_UNDEFINED) {
++        VkAttachmentDescription d = {};
++        d.format = fmt;
++        d.samples = VK_SAMPLE_COUNT_1_BIT;
++        d.loadOp = cLoad;
++        d.storeOp = cStore;
++        d.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        d.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        d.initialLayout = cLayout;
++        d.finalLayout = cLayout;
++        colorRefs.push_back({ uint32_t(atts.size()), cLayout });
++        atts.push_back(d);
++        fbViews.push_back(ca.imageView);
++        clears.push_back(ca.clearValue);
++      } else {
++        colorRefs.push_back({ VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED });
++      }
++    }
++
++    const VkRenderingAttachmentInfo* dsAtt = info->pDepthAttachment ? info->pDepthAttachment : info->pStencilAttachment;
++    VkFormat dsFmt = (dsAtt && dsAtt->imageView) ? getFmt(dsAtt->imageView) : VK_FORMAT_UNDEFINED;
++    rpKey.push_back(uint32_t(dsFmt));
++    VkAttachmentReference depthRef = { VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED };
++    if (dsFmt != VK_FORMAT_UNDEFINED) {
++      VkAttachmentLoadOp dLoad = sanitizeLoad(info->pDepthAttachment ? info->pDepthAttachment->loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE);
++      VkAttachmentStoreOp dStore = sanitizeStore(info->pDepthAttachment ? info->pDepthAttachment->storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE);
++      VkAttachmentLoadOp sLoad = sanitizeLoad(info->pStencilAttachment ? info->pStencilAttachment->loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE);
++      VkAttachmentStoreOp sStore = sanitizeStore(info->pStencilAttachment ? info->pStencilAttachment->storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE);
++      VkImageLayout dsLayout = sanitizeLayout(dsAtt->imageLayout, true);
++      rpKey.push_back(uint32_t(dLoad));
++      rpKey.push_back(uint32_t(dStore));
++      rpKey.push_back(uint32_t(sLoad));
++      rpKey.push_back(uint32_t(sStore));
++      rpKey.push_back(uint32_t(dsLayout));
++
++      VkAttachmentDescription d = {};
++      d.format = dsFmt;
++      d.samples = VK_SAMPLE_COUNT_1_BIT;
++      d.loadOp = dLoad;
++      d.storeOp = dStore;
++      d.stencilLoadOp = sLoad;
++      d.stencilStoreOp = sStore;
++      d.initialLayout = dsLayout;
++      d.finalLayout = dsLayout;
++      depthRef = { uint32_t(atts.size()), dsLayout };
++      atts.push_back(d);
++      fbViews.push_back(dsAtt->imageView);
++      VkClearValue cv = dsAtt->clearValue;
++      if (info->pStencilAttachment)
++        cv.depthStencil.stencil = info->pStencilAttachment->clearValue.depthStencil.stencil;
++      clears.push_back(cv);
++    }
++
++    if (atts.empty()) {
++      Logger::err(str::format("beginCompatRenderPass: atts.empty()! colors=", info->colorAttachmentCount,
++        " dsAtt=", (dsAtt != nullptr), " area=", info->renderArea.extent.width, "x", info->renderArea.extent.height));
++      return;
++    }
++
++    if (info->flags != 0) {
++      Logger::err(str::format("beginCompatRenderPass: non-zero flags=0x", std::hex, info->flags));
++    }
++
++    VkRenderPass rp = VK_NULL_HANDLE;
++    auto rpIt = m_compatRenderPasses.find(rpKey);
++    if (rpIt != m_compatRenderPasses.end()) {
++      rp = rpIt->second;
++    } else {
++      VkSubpassDescription subpass = {};
++      subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++      subpass.colorAttachmentCount = uint32_t(colorRefs.size());
++      subpass.pColorAttachments = colorRefs.empty() ? nullptr : colorRefs.data();
++      subpass.pDepthStencilAttachment = (dsFmt != VK_FORMAT_UNDEFINED) ? &depthRef : nullptr;
++
++      VkRenderPassCreateInfo rpInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++      rpInfo.attachmentCount = uint32_t(atts.size());
++      rpInfo.pAttachments = atts.empty() ? nullptr : atts.data();
++      rpInfo.subpassCount = 1;
++      rpInfo.pSubpasses = &subpass;
++
++      if (m_vkd->vkCreateRenderPass(m_vkd->device(), &rpInfo, nullptr, &rp) != VK_SUCCESS)
++        throw DxvkError("Failed to create compat VkRenderPass");
++      m_compatRenderPasses.emplace(rpKey, rp);
++    }
++
++    uint32_t fbWidth = info->renderArea.offset.x + info->renderArea.extent.width;
++    uint32_t fbHeight = info->renderArea.offset.y + info->renderArea.extent.height;
++    std::vector<uint64_t> fbKey;
++    fbKey.push_back(uint64_t(rp));
++    fbKey.push_back(uint64_t(fbWidth) | (uint64_t(fbHeight) << 32));
++    fbKey.push_back(uint64_t(info->layerCount ? info->layerCount : 1u));
++    for (VkImageView v : fbViews)
++      fbKey.push_back(uint64_t(v));
++
++    VkFramebuffer fb = VK_NULL_HANDLE;
++    auto fbIt = m_compatFramebuffers.find(fbKey);
++    if (fbIt != m_compatFramebuffers.end()) {
++      fb = fbIt->second;
++    } else {
++      VkFramebufferCreateInfo fbInfo = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++      fbInfo.renderPass = rp;
++      fbInfo.attachmentCount = uint32_t(fbViews.size());
++      fbInfo.pAttachments = fbViews.empty() ? nullptr : fbViews.data();
++      fbInfo.width = fbWidth ? fbWidth : 1u;
++      fbInfo.height = fbHeight ? fbHeight : 1u;
++      fbInfo.layers = info->layerCount ? info->layerCount : 1u;
++      if (m_vkd->vkCreateFramebuffer(m_vkd->device(), &fbInfo, nullptr, &fb) != VK_SUCCESS)
++        throw DxvkError("Failed to create compat VkFramebuffer");
++      m_compatFramebuffers.emplace(fbKey, fb);
++      for (VkImageView v : fbViews)
++        m_compatViewToFbs[uint64_t(v)].push_back(fbKey);
++    }
++
++    if (m_compatActiveCmdBuffers[uint64_t(cmdBuffer)]) {
++      Logger::warn("DxvkDevice::beginCompatRenderPass: ending previous active compat render pass on cmdBuffer");
++      m_vkd->vkCmdEndRenderPass(cmdBuffer);
++      m_compatActiveCmdBuffers[uint64_t(cmdBuffer)] = false;
++    }
++
++    VkRenderPassBeginInfo beginInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++    beginInfo.renderPass = rp;
++    beginInfo.framebuffer = fb;
++    beginInfo.renderArea = info->renderArea;
++    if (beginInfo.renderArea.extent.width == 0 || beginInfo.renderArea.extent.height == 0) {
++      Logger::err(str::format("beginCompatRenderPass: zero renderArea ", beginInfo.renderArea.extent.width, "x", beginInfo.renderArea.extent.height));
++      beginInfo.renderArea.extent.width = fbWidth ? fbWidth : 1u;
++      beginInfo.renderArea.extent.height = fbHeight ? fbHeight : 1u;
++    }
++    beginInfo.clearValueCount = uint32_t(clears.size());
++    beginInfo.pClearValues = clears.empty() ? nullptr : clears.data();
++    m_vkd->vkCmdBeginRenderPass(cmdBuffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
++    m_compatActiveCmdBuffers[uint64_t(cmdBuffer)] = true;
++  }
++
++  void DxvkDevice::endCompatRenderPass(VkCommandBuffer cmdBuffer) {
++    std::lock_guard<std::mutex> lock(m_compatMutex);
++    auto it = m_compatActiveCmdBuffers.find(uint64_t(cmdBuffer));
++    if (it != m_compatActiveCmdBuffers.end() && it->second) {
++      it->second = false;
++      m_vkd->vkCmdEndRenderPass(cmdBuffer);
++    } else {
++      Logger::warn("DxvkDevice::endCompatRenderPass: skipped vkCmdEndRenderPass on inactive cmdBuffer");
++    }
++  }
++
++  void dxvkBeginCompatRenderPass(
++          DxvkDevice*               device,
++          VkCommandBuffer           cmdBuffer,
++    const VkRenderingInfo*          info) {
++    device->beginCompatRenderPass(cmdBuffer, info);
++  }
++
++  void dxvkEndCompatRenderPass(
++          DxvkDevice*               device,
++          VkCommandBuffer           cmdBuffer) {
++    device->endCompatRenderPass(cmdBuffer);
++  }
++
+ }
+diff --git a/src/dxvk/dxvk_device.h b/src/dxvk/dxvk_device.h
+index 7fb070d..1654396 100644
+--- a/src/dxvk/dxvk_device.h
++++ b/src/dxvk/dxvk_device.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++#include <map>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++
+ #include "dxvk_adapter.h"
+ #include "dxvk_buffer.h"
+ #include "dxvk_compute.h"
+@@ -99,6 +104,14 @@ namespace dxvk {
+      * \brief Vulkan device functions
+      * \returns Vulkan device functions
+      */
++    /** Driver pipeline cache kept between runs (ME_PC_PIPELINE_CACHE), or VK_NULL_HANDLE. */
++    VkPipelineCache pipelineCache() const {
++      return m_pipelineCache;
++    }
++
++    /** Called after a pipeline was compiled: writes the cache out now and then. */
++    void pipelineCompiled();
++
+     Rc<vk::DeviceFn> vkd() const {
+       return m_vkd;
+     }
+@@ -747,6 +760,12 @@ namespace dxvk {
+      * used by the GPU can be safely destroyed.
+      */
+     void waitForIdle();
++
++    void registerCompatImageView(VkImageView view, VkFormat format);
++    void unregisterCompatImageView(VkImageView view);
++    VkRenderPass getCompatPipelineRenderPass(const VkPipelineRenderingCreateInfo& rtInfo);
++    void beginCompatRenderPass(VkCommandBuffer cmdBuffer, const VkRenderingInfo* info);
++    void endCompatRenderPass(VkCommandBuffer cmdBuffer);
+     
+   private:
+     
+@@ -766,6 +785,10 @@ namespace dxvk {
+     DxvkShaderOptions           m_shaderOptions;
+ 
+     DxvkDevicePerfHints         m_perfHints;
++    VkPipelineCache             m_pipelineCache = VK_NULL_HANDLE;
++    std::atomic<bool>           m_pipelineCacheDirty = { false };
++    std::atomic<bool>           m_pipelineCacheBusy = { false };
++
+     DxvkObjects                 m_objects;
+     DxvkCheckpointBuffer        m_checkpoints;
+ 
+@@ -778,6 +801,13 @@ namespace dxvk {
+ 
+     Rc<DxvkShaderCache>         m_shaderCache;
+ 
++    std::mutex                  m_compatMutex;
++    std::unordered_map<uint64_t, VkFormat> m_compatViewFormats;
++    std::map<std::vector<uint32_t>, VkRenderPass> m_compatRenderPasses;
++    std::map<std::vector<uint64_t>, VkFramebuffer> m_compatFramebuffers;
++    std::unordered_map<uint64_t, std::vector<std::vector<uint64_t>>> m_compatViewToFbs;
++    std::unordered_map<uint64_t, bool> m_compatActiveCmdBuffers;
++
+     DxvkDevicePerfHints getPerfHints();
+ 
+     void recycleCommandList(
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 63d89d9..fef49fb 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -68,6 +68,7 @@ namespace dxvk {
+     HANDLE_EXT(khrSwapchain);                      \
+     HANDLE_EXT(khrSwapchainMaintenance1);          \
+     HANDLE_EXT(khrSwapchainMutableFormat);         \
++    HANDLE_EXT(khrTimelineSemaphore);              \
+     HANDLE_EXT(khrUnifiedImageLayouts);            \
+     HANDLE_EXT(khrWin32KeyedMutex);                \
+     HANDLE_EXT(amdBufferMarker);                   \
+@@ -753,6 +754,9 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    /* Android: every missing feature in one log line, a device is tested once per build. */
++    std::string missing;
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+@@ -760,12 +764,17 @@ namespace dxvk {
+         if (f.extensionEnabled)
+           message += str::format(" (extension: ", f.extensionEnabled->extensionName, ")");
+ 
+-        return message;
++        missing += (missing.empty() ? "" : "; ") + message;
+       }
+     }
+ 
+-    if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
+-      return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
++    if (!missing.empty()) {
++      Logger::warn(str::format("Device missing modern Vulkan features (non-fatal for D3D9): ", missing));
++    }
++
++    if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize) {
++      Logger::warn(str::format("Device push constants size limited: ", m_properties.core.properties.limits.maxPushConstantsSize));
++    }
+ 
+     return std::nullopt;
+   }
+@@ -1029,7 +1038,7 @@ namespace dxvk {
+ 
+       /* LOAD_OP_NONE for certain tiler optimizations. Core feature
+        * in Vulkan 1.4, so probably supported by everything we need. */
+-      ENABLE_EXT(khrLoadStoreOpNone, true),
++      ENABLE_EXT(khrLoadStoreOpNone, false), /* Android: Adreno 750 driver 0.762 lacks it; see cmdBeginRendering */
+ 
+       /* Maintenance features, relied on in various parts of the code */
+       ENABLE_EXT_FEATURE(khrMaintenance5, maintenance5, true),
+@@ -1068,6 +1077,9 @@ namespace dxvk {
+       /* Mutable format used to change srgb-ness of swapchain views */
+       ENABLE_EXT(khrSwapchainMutableFormat, false),
+ 
++      /* Timeline semaphore KHR extension for Vulkan 1.1 drivers */
++      ENABLE_EXT(khrTimelineSemaphore, true),
++
+       /* Use GENERAL layout for everything */
+       ENABLE_EXT_FEATURE(khrUnifiedImageLayouts, unifiedImageLayouts, false),
+ 
+diff --git a/src/dxvk/dxvk_device_info.h b/src/dxvk/dxvk_device_info.h
+index 54deab3..d41dcca 100644
+--- a/src/dxvk/dxvk_device_info.h
++++ b/src/dxvk/dxvk_device_info.h
+@@ -110,6 +110,7 @@ namespace dxvk {
+     VkPhysicalDeviceShaderUntypedPointersFeaturesKHR          khrShaderUntypedPointers        = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR };
+     VkBool32                                                  khrSwapchain                    = VK_FALSE;
+     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR          khrSwapchainMaintenance1        = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR };
++    VkBool32                                                  khrTimelineSemaphore            = VK_FALSE;
+     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR            khrUnifiedImageLayouts          = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR };
+     VkBool32                                                  khrSwapchainMutableFormat       = VK_FALSE;
+     VkBool32                                                  khrWin32KeyedMutex              = VK_FALSE;
+@@ -187,6 +188,7 @@ namespace dxvk {
+     VkExtensionProperties khrSwapchain                      = vk::makeExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+     VkExtensionProperties khrSwapchainMaintenance1          = vk::makeExtension(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+     VkExtensionProperties khrSwapchainMutableFormat         = vk::makeExtension(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
++    VkExtensionProperties khrTimelineSemaphore              = vk::makeExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+     VkExtensionProperties khrUnifiedImageLayouts            = vk::makeExtension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+     VkExtensionProperties khrWin32KeyedMutex                = vk::makeExtension(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
+     VkExtensionProperties amdBufferMarker                   = vk::makeExtension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index 2c5334d..865ffba 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -1,6 +1,7 @@
+ #include <iomanip>
+ 
+ #include "../util/util_time.h"
++#include "../util/util_me_trace.h"
+ 
+ #include "dxvk_device.h"
+ #include "dxvk_graphics.h"
+@@ -588,8 +589,20 @@ namespace dxvk {
+ 
+     // Set up depth clip state. Require depth clip support,
+     // this is *not* equivalent to disabling depth clamp.
+-    rsDepthClipInfo.pNext = std::exchange(rsInfo.pNext, &rsDepthClipInfo);
+-    rsDepthClipInfo.depthClipEnable = state.rs.depthClipEnable();
++    if (device->features().extDepthClipEnable.depthClipEnable) {
++      rsDepthClipInfo.pNext = std::exchange(rsInfo.pNext, &rsDepthClipInfo);
++      rsDepthClipInfo.depthClipEnable = state.rs.depthClipEnable();
++    } else {
++      rsInfo.depthClampEnable = state.rs.depthClipEnable() ? VK_FALSE : VK_TRUE;
++    }
++
++    if (!device->features().vk13.dynamicRendering) {
++      vpInfo.viewportCount = 1;
++      vpInfo.scissorCount = 1;
++      rsInfo.cullMode = VkCullModeFlags(state.compat.cullMode);
++      rsInfo.frontFace = VkFrontFace(state.compat.frontFace);
++      rsInfo.depthBiasEnable = VkBool32(state.compat.depthBiasEnable);
++    }
+ 
+     // Set up conservative rasterization if requested by the application.
+     if (state.rs.conservativeMode() != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) {
+@@ -626,7 +639,11 @@ namespace dxvk {
+     bool eq = tsInfo.patchControlPoints == other.tsInfo.patchControlPoints;
+ 
+     if (eq) {
+-      eq = rsInfo.depthClampEnable         == other.rsInfo.depthClampEnable
++      eq = vpInfo.viewportCount            == other.vpInfo.viewportCount
++        && vpInfo.scissorCount             == other.vpInfo.scissorCount
++        && rsInfo.cullMode                 == other.rsInfo.cullMode
++        && rsInfo.frontFace                == other.rsInfo.frontFace
++        && rsInfo.depthClampEnable         == other.rsInfo.depthClampEnable
+         && rsInfo.rasterizerDiscardEnable  == other.rsInfo.rasterizerDiscardEnable
+         && rsInfo.polygonMode              == other.rsInfo.polygonMode
+         && rsInfo.depthBiasEnable          == other.rsInfo.depthBiasEnable
+@@ -655,6 +672,10 @@ namespace dxvk {
+     DxvkHashState hash;
+     hash.add(tsInfo.patchControlPoints);
+ 
++    hash.add(vpInfo.viewportCount);
++    hash.add(vpInfo.scissorCount);
++    hash.add(rsInfo.cullMode);
++    hash.add(rsInfo.frontFace);
+     hash.add(rsInfo.depthClampEnable);
+     hash.add(rsInfo.rasterizerDiscardEnable);
+     hash.add(rsInfo.polygonMode);
+@@ -698,7 +719,26 @@ namespace dxvk {
+   DxvkGraphicsPipelineFragmentShaderState::DxvkGraphicsPipelineFragmentShaderState(
+     const DxvkDevice*                     device,
+     const DxvkGraphicsPipelineStateInfo&  state) {
++    if (!device->features().vk13.dynamicRendering) {
++      dsInfo.depthTestEnable = state.compat.depthTest;
++      dsInfo.depthWriteEnable = state.compat.depthWrite;
++      dsInfo.depthCompareOp = VkCompareOp(state.compat.depthCompareOp);
++      dsInfo.depthBoundsTestEnable = state.compat.depthBoundsTestEnable;
++      dsInfo.stencilTestEnable = state.compat.stencilTest;
++
++      auto fillStencil = [](VkStencilOpState& dst, const DxvkGraphicsPipelineStateInfo::CompatStencilOp& src) {
++        dst.failOp = VkStencilOp(src.failOp);
++        dst.passOp = VkStencilOp(src.passOp);
++        dst.depthFailOp = VkStencilOp(src.depthFailOp);
++        dst.compareOp = VkCompareOp(src.compareOp);
++        dst.compareMask = src.compareMask;
++        dst.writeMask = src.writeMask;
++        dst.reference = 0;
++      };
+ 
++      fillStencil(dsInfo.front, state.compat.front);
++      fillStencil(dsInfo.back, state.compat.back);
++    }
+   }
+ 
+ 
+@@ -770,6 +810,33 @@ namespace dxvk {
+     const DxvkDevice*                     device,
+     const DxvkGraphicsPipelineStateInfo&  state,
+           DxvkGraphicsPipelineFlags       flags) {
++    if (!device->features().vk13.dynamicRendering) {
++      if (!flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)) {
++        dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT;
++        dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR;
++        dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
++
++        if (state.useDynamicDepthBounds() && device->features().core.features.depthBounds)
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
++
++        if (state.useDynamicBlendConstants())
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
++
++        if (state.useDynamicStencilTest()) {
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK;
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
++        }
++
++        if (state.useSampleLocations() && device->canUseSampleLocations(0u))
++          dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
++      }
++
++      if (dyInfo.dynamicStateCount)
++        dyInfo.pDynamicStates = dyStates.data();
++      return;
++    }
++
+     if (state.useDynamicVertexStrides())
+       dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+ 
+@@ -1486,18 +1553,33 @@ namespace dxvk {
+       info.pTessellationState     = &key.prState.tsInfo;
+ 
+     if (!m_flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)) {
+-      info.pNext                  = &key.foState.rtInfo;
++      if (m_device->features().vk13.dynamicRendering)
++        info.pNext                = &key.foState.rtInfo;
++      else
++        info.renderPass           = m_device->getCompatPipelineRenderPass(key.foState.rtInfo);
+       info.pViewportState         = &key.prState.vpInfo;
+       info.pMultisampleState      = &key.foState.msInfo;
+       info.pDepthStencilState     = &key.fsState.dsInfo;
+       info.pColorBlendState       = &key.foState.cbInfo;
++    } else if (!m_device->features().vk13.dynamicRendering) {
++      info.renderPass             = m_device->getCompatPipelineRenderPass(key.foState.rtInfo);
+     }
+ 
+     if (flags.flags)
+       flags.pNext = std::exchange(info.pNext, &flags);
+ 
+     VkPipeline pipeline = VK_NULL_HANDLE;
+-    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
++    uint64_t compileStart = meTraceOn() ? meNowUs() : 0u;
++    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), m_device->pipelineCache(), 1, &info, nullptr, &pipeline);
++
++    if (vr == VK_SUCCESS)
++      m_device->pipelineCompiled();
++
++    if (compileStart) {
++      uint64_t us = meNowUs() - compileStart;
++      if (us >= 1000u)
++        meTrace("pipeline %.1f ms", double(us) / 1000.0);
++    }
+ 
+     if (vr != VK_SUCCESS) {
+       Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
+diff --git a/src/dxvk/dxvk_graphics_state.h b/src/dxvk/dxvk_graphics_state.h
+index 06d5c10..4d35038 100644
+--- a/src/dxvk/dxvk_graphics_state.h
++++ b/src/dxvk/dxvk_graphics_state.h
+@@ -724,6 +724,28 @@ namespace dxvk {
+     DxvkOmAttachmentBlend   omBlend           [DxvkLimits::MaxNumRenderTargets];
+     DxvkIlAttribute         ilAttributes      [DxvkLimits::MaxNumVertexAttributes];
+     DxvkIlBinding           ilBindings        [DxvkLimits::MaxNumVertexBindings];
++
++    struct CompatStencilOp {
++      uint8_t failOp;
++      uint8_t passOp;
++      uint8_t depthFailOp;
++      uint8_t compareOp;
++      uint8_t compareMask;
++      uint8_t writeMask;
++    };
++
++    struct CompatDynState {
++      CompatStencilOp front;
++      CompatStencilOp back;
++      uint8_t depthTest;
++      uint8_t depthWrite;
++      uint8_t depthCompareOp;
++      uint8_t stencilTest;
++      uint8_t cullMode;
++      uint8_t frontFace;
++      uint8_t depthBiasEnable;
++      uint8_t depthBoundsTestEnable;
++    } compat;
+   };
+ 
+ 
+diff --git a/src/dxvk/dxvk_instance.h b/src/dxvk/dxvk_instance.h
+index 1b0263e..9c1d1ba 100644
+--- a/src/dxvk/dxvk_instance.h
++++ b/src/dxvk/dxvk_instance.h
+@@ -9,7 +9,7 @@
+ 
+ namespace dxvk {
+ 
+-  constexpr uint32_t DxvkVulkanApiVersion = VK_API_VERSION_1_3;
++  constexpr uint32_t DxvkVulkanApiVersion = VK_API_VERSION_1_1;
+ 
+   /**
+    * \brief Vulkan instance creation parameters
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index fc18044..dbf39fa 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -182,8 +182,10 @@ namespace dxvk {
+   DxvkResourceImageViewMap::~DxvkResourceImageViewMap() {
+     auto vk = m_device->vkd();
+ 
+-    for (const auto& view : m_views)
++    for (const auto& view : m_views) {
++      m_device->unregisterCompatImageView(view.second.legacy.image.imageView);
+       vk->vkDestroyImageView(vk->device(), view.second.legacy.image.imageView, nullptr);
++    }
+   }
+ 
+ 
+@@ -224,6 +226,9 @@ namespace dxvk {
+       VkResult vr = vk->vkCreateImageView(
+         vk->device(), &viewInfo, nullptr, &descriptor.legacy.image.imageView);
+ 
++      if (vr == VK_SUCCESS && !m_device->features().vk13.dynamicRendering)
++        m_device->registerCompatImageView(descriptor.legacy.image.imageView, key.format);
++
+       // Not fatal on descriptor heap path
+       if (vr && (renderTargetUsage || !m_device->canUseDescriptorHeap()))
+         throw DxvkError(str::format("Failed to create image view: ", vr));
+@@ -1306,6 +1311,7 @@ namespace dxvk {
+     const VkBufferCreateInfo&         createInfo,
+     const DxvkAllocationInfo&         allocationInfo,
+     const DxvkBufferImportInfo&       importInfo) {
++    std::lock_guard lock(m_mutex);
+     Rc<DxvkResourceAllocation> allocation = m_allocationPool.create(this, nullptr);
+     allocation->m_flags.set(DxvkAllocationFlag::Imported);
+     allocation->m_resourceCookie = allocationInfo.resourceCookie;
+@@ -1325,6 +1331,7 @@ namespace dxvk {
+     const VkImageCreateInfo&          createInfo,
+     const DxvkAllocationInfo&         allocationInfo,
+           VkImage                     imageHandle) {
++    std::lock_guard lock(m_mutex);
+     Rc<DxvkResourceAllocation> allocation = m_allocationPool.create(this, nullptr);
+     allocation->m_flags.set(DxvkAllocationFlag::Imported);
+     allocation->m_resourceCookie = allocationInfo.resourceCookie;
+@@ -2058,8 +2065,10 @@ namespace dxvk {
+                              | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                              | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                              | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
+-                             | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
+-                             | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++                             | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
++
++    if (m_device->features().vk12.bufferDeviceAddress)
++      flags |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+ 
+     if (m_device->features().extTransformFeedback.transformFeedback) {
+       flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
+@@ -2273,10 +2282,22 @@ namespace dxvk {
+           VkMemoryRequirements2&  memoryRequirements) const {
+     auto vk = m_device->vkd();
+ 
+-    VkDeviceBufferMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS };
+-    info.pCreateInfo = &createInfo;
++    if (vk->vkGetDeviceBufferMemoryRequirements) {
++      VkDeviceBufferMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS };
++      info.pCreateInfo = &createInfo;
++
++      vk->vkGetDeviceBufferMemoryRequirements(vk->device(), &info, &memoryRequirements);
++      return true;
++    }
++
++    VkBuffer buffer = VK_NULL_HANDLE;
++    if (vk->vkCreateBuffer(vk->device(), &createInfo, nullptr, &buffer) != VK_SUCCESS)
++      return false;
+ 
+-    vk->vkGetDeviceBufferMemoryRequirements(vk->device(), &info, &memoryRequirements);
++    VkBufferMemoryRequirementsInfo2 reqInfo = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
++    reqInfo.buffer = buffer;
++    vk->vkGetBufferMemoryRequirements2(vk->device(), &reqInfo, &memoryRequirements);
++    vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+     return true;
+   }
+ 
+@@ -2286,10 +2307,22 @@ namespace dxvk {
+           VkMemoryRequirements2&  memoryRequirements) const {
+     auto vk = m_device->vkd();
+ 
+-    VkDeviceImageMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS };
+-    info.pCreateInfo = &createInfo;
++    if (vk->vkGetDeviceImageMemoryRequirements) {
++      VkDeviceImageMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS };
++      info.pCreateInfo = &createInfo;
++
++      vk->vkGetDeviceImageMemoryRequirements(vk->device(), &info, &memoryRequirements);
++      return true;
++    }
++
++    VkImage image = VK_NULL_HANDLE;
++    if (vk->vkCreateImage(vk->device(), &createInfo, nullptr, &image) != VK_SUCCESS)
++      return false;
+ 
+-    vk->vkGetDeviceImageMemoryRequirements(vk->device(), &info, &memoryRequirements);
++    VkImageMemoryRequirementsInfo2 reqInfo = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
++    reqInfo.image = image;
++    vk->vkGetImageMemoryRequirements2(vk->device(), &reqInfo, &memoryRequirements);
++    vk->vkDestroyImage(vk->device(), image, nullptr);
+     return true;
+   }
+ 
+@@ -2333,6 +2366,8 @@ namespace dxvk {
+ 
+   VkDeviceAddress DxvkMemoryAllocator::getBufferDeviceAddress(VkBuffer buffer) const {
+     auto vk = m_device->vkd();
++    if (!vk->vkGetBufferDeviceAddress || !m_device->features().vk12.bufferDeviceAddress)
++      return 0;
+ 
+     VkBufferDeviceAddressInfo bdaInfo = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+     bdaInfo.buffer = buffer;
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index f93ae8d..414956b 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -106,6 +106,10 @@ namespace dxvk {
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++#ifdef __ANDROID__
++      if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++        m_acquireStatus = VK_SUCCESS;
++#endif
+     }
+ 
+     // This is a normal occurence, but may be useful for
+@@ -130,6 +134,10 @@ namespace dxvk {
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++#ifdef __ANDROID__
++      if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++        m_acquireStatus = VK_SUCCESS;
++#endif
+ 
+       if (m_acquireStatus < 0) {
+         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
+@@ -269,12 +277,21 @@ namespace dxvk {
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++#ifdef __ANDROID__
++      if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++        m_acquireStatus = VK_SUCCESS;
++#endif
+     }
+ 
+     // Recreate the swapchain on the next acquire, even if we get suboptimal.
+     // There is no guarantee that suboptimal state is returned by both functions.
+     std::lock_guard lock(m_surfaceMutex);
+ 
++#ifdef __ANDROID__
++    if (status == VK_SUBOPTIMAL_KHR)
++      status = VK_SUCCESS;
++#endif
++
+     if (status != VK_SUCCESS) {
+       Logger::info(str::format("Presenter: Got ", status, ", recreating swapchain"));
+ 
+@@ -1102,6 +1119,13 @@ namespace dxvk {
+       }
+     }
+ 
++    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
++      for (uint32_t i = 0; i < numSupported; i++) {
++        if (pSupported[i].colorSpace == colorSpace && pSupported[i].format == VK_FORMAT_R8G8B8A8_UNORM)
++          return pSupported[i].format;
++      }
++    }
++
+     // Otherwise, find a supported format for the color space
+     const PresenterFormatList* compatList = nullptr;
+ 
+diff --git a/src/dxvk/dxvk_shader.cpp b/src/dxvk/dxvk_shader.cpp
+index 8f6261b..ccd8d52 100644
+--- a/src/dxvk/dxvk_shader.cpp
++++ b/src/dxvk/dxvk_shader.cpp
+@@ -105,6 +105,18 @@ namespace dxvk {
+     stageInfo.pName = "main";
+     stageInfo.pSpecializationInfo = specInfo;
+ 
++    if (!m_device->features().khrMaintenance5.maintenance5
++     && !m_device->canUseGraphicsPipelineLibrary()) {
++      VkShaderModule mod = VK_NULL_HANDLE;
++      VkShaderModuleCreateInfo smInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++      smInfo.codeSize = codeBuffer.size();
++      smInfo.pCode = codeBuffer.data();
++      if (m_device->vkd()->vkCreateShaderModule(m_device->vkd()->device(), &smInfo, nullptr, &mod) == VK_SUCCESS) {
++        stageInfo.pNext = m_next;
++        stageInfo.module = mod;
++      }
++    }
++
+     m_stageCount++;
+   }
+   
+@@ -135,7 +147,10 @@ namespace dxvk {
+ 
+ 
+   DxvkShaderStageInfo::~DxvkShaderStageInfo() {
+-
++    for (uint32_t i = 0; i < m_stageCount; i++) {
++      if (m_stageInfos[i].module != VK_NULL_HANDLE)
++        m_device->vkd()->vkDestroyShaderModule(m_device->vkd()->device(), m_stageInfos[i].module, nullptr);
++    }
+   }
+ 
+ 
+diff --git a/src/dxvk/dxvk_swapchain_blitter.cpp b/src/dxvk/dxvk_swapchain_blitter.cpp
+index 1bcdafa..4b04f71 100644
+--- a/src/dxvk/dxvk_swapchain_blitter.cpp
++++ b/src/dxvk/dxvk_swapchain_blitter.cpp
+@@ -1,9 +1,12 @@
++#include <cstdlib>
++#include <cstring>
+ #include "dxvk_swapchain_blitter.h"
+ 
+ #include <dxvk_cursor_frag.h>
+ #include <dxvk_cursor_vert.h>
+ #include <dxvk_present_frag.h>
+ #include <dxvk_present_frag_blit.h>
++#include <dxvk_present_frag_upscale.h>
+ #include <dxvk_present_frag_ms.h>
+ #include <dxvk_present_frag_ms_blit.h>
+ #include <dxvk_present_vert.h>
+@@ -299,6 +302,15 @@ namespace dxvk {
+     key.dstFormat = dstView->info().format;
+     key.needsGamma = m_gammaView != nullptr;
+     key.needsBlit = dstRect.extent != srcRect.extent;
++
++    /* ME_PC_UPSCALER=fsr|sgsr (app setting): only when the image is really enlarged. */
++    static const uint32_t upscaler = [] {
++      const char* name = std::getenv("ME_PC_UPSCALER");
++      return !name ? 0u : !std::strcmp(name, "fsr") ? 1u : !std::strcmp(name, "sgsr") ? 2u : 0u;
++    }();
++
++    if (key.needsBlit && dstRect.extent.width > srcRect.extent.width && srcView->image()->info().sampleCount == VK_SAMPLE_COUNT_1_BIT)
++      key.upscaler = upscaler;
+     key.compositeHud = composite && m_hudSrv;
+     key.compositeCursor = composite && m_cursorView;
+ 
+@@ -718,7 +730,7 @@ namespace dxvk {
+     const DxvkSwapchainPipelineKey&   key) {
+     auto vk = m_device->vkd();
+ 
+-    static const std::array<VkSpecializationMapEntry, 8> specMap = {{
++    static const std::array<VkSpecializationMapEntry, 9> specMap = {{
+       { 0, offsetof(SpecConstants, sampleCount),    sizeof(VkSampleCountFlagBits) },
+       { 1, offsetof(SpecConstants, gammaBound),     sizeof(VkBool32) },
+       { 2, offsetof(SpecConstants, srcSpace),       sizeof(VkColorSpaceKHR) },
+@@ -727,6 +739,7 @@ namespace dxvk {
+       { 5, offsetof(SpecConstants, dstIsSrgb),      sizeof(VkBool32) },
+       { 6, offsetof(SpecConstants, compositeHud),   sizeof(VkBool32) },
+       { 7, offsetof(SpecConstants, compositeCursor),sizeof(VkBool32) },
++      { 8, offsetof(SpecConstants, upscaler),       sizeof(uint32_t) },
+     }};
+ 
+     SpecConstants specConstants = { };
+@@ -738,6 +751,7 @@ namespace dxvk {
+     specConstants.dstIsSrgb = lookupFormatInfo(key.dstFormat)->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+     specConstants.compositeCursor = key.compositeCursor;
+     specConstants.compositeHud = key.compositeHud;
++    specConstants.upscaler = key.upscaler;
+ 
+     // Avoid redundant color space conversions if color spaces
+     // and images properties match and we don't do a resolve
+@@ -757,7 +771,9 @@ namespace dxvk {
+     state.vs = util::DxvkBuiltInShaderStage(dxvk_present_vert, nullptr);
+ 
+     if (key.srcSamples == VK_SAMPLE_COUNT_1_BIT) {
+-      state.fs = key.needsBlit
++      state.fs = key.upscaler
++        ? util::DxvkBuiltInShaderStage(dxvk_present_frag_upscale, &specInfo)
++        : key.needsBlit
+         ? util::DxvkBuiltInShaderStage(dxvk_present_frag_blit, &specInfo)
+         : util::DxvkBuiltInShaderStage(dxvk_present_frag, &specInfo);
+     } else {
+diff --git a/src/dxvk/dxvk_swapchain_blitter.h b/src/dxvk/dxvk_swapchain_blitter.h
+index f5233ba..a863a4f 100644
+--- a/src/dxvk/dxvk_swapchain_blitter.h
++++ b/src/dxvk/dxvk_swapchain_blitter.h
+@@ -43,6 +43,8 @@ namespace dxvk {
+     VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+     /// Bit indicating whether the input and output dimensions match.
+     VkBool32 needsBlit = VK_FALSE;
++    /// Upscaler for the blit: 0 bilinear, 1 FSR 1, 2 SGSR 1.
++    uint32_t upscaler = 0u;
+     /// Bit indicating whether a gamma curve is to be applied.
+     VkBool32 needsGamma = VK_FALSE;
+     /// Bit indicating whether the HUD needs to be composited
+@@ -58,6 +60,7 @@ namespace dxvk {
+       hash.add(uint32_t(dstSpace));
+       hash.add(uint32_t(dstFormat));
+       hash.add(uint32_t(needsBlit));
++      hash.add(uint32_t(upscaler));
+       hash.add(uint32_t(needsGamma));
+       hash.add(uint32_t(compositeHud));
+       hash.add(uint32_t(compositeCursor));
+@@ -71,6 +74,7 @@ namespace dxvk {
+           && dstSpace == other.dstSpace
+           && dstFormat == other.dstFormat
+           && needsBlit == other.needsBlit
++          && upscaler == other.upscaler
+           && needsGamma == other.needsGamma
+           && compositeHud == other.compositeHud
+           && compositeCursor == other.compositeCursor;
+@@ -186,6 +190,7 @@ namespace dxvk {
+       VkBool32 dstIsSrgb;
+       VkBool32 compositeHud;
+       VkBool32 compositeCursor;
++      uint32_t upscaler = 0u;
+     };
+ 
+     struct PushConstants {
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+index 6b12f95..897c543 100644
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -8,6 +8,7 @@ dxvk_shaders = files([
+ 
+   'shaders/dxvk_present_frag.frag',
+   'shaders/dxvk_present_frag_blit.frag',
++  'shaders/dxvk_present_frag_upscale.frag',
+   'shaders/dxvk_present_frag_ms.frag',
+   'shaders/dxvk_present_frag_ms_blit.frag',
+   'shaders/dxvk_present_vert.vert',
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 5158cd7..9f3f3a1 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -1,4 +1,5 @@
+ #include <utility>
++#include <dlfcn.h>
+ 
+ #include "log.h"
+ 
+@@ -109,6 +110,13 @@ namespace dxvk {
+ #else
+           // For native builds, logging to stderr should be fine.
+           std::cerr << adjusted;
++#ifdef __ANDROID__
++          typedef int (*pfn_log_write)(int prio, const char* tag, const char* text);
++          static pfn_log_write s_log_write = (pfn_log_write)dlsym(RTLD_DEFAULT, "__android_log_write");
++          if (s_log_write) {
++            s_log_write(3, "DXVK", adjusted.c_str());
++          }
++#endif
+ #endif
+         }
+ 
+diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
+index f9d1e98..61b8551 100644
+--- a/src/vulkan/vulkan_loader.cpp
++++ b/src/vulkan/vulkan_loader.cpp
+@@ -7,9 +7,48 @@
+ #include "../util/util_string.h"
+ #include "../util/util_win32_compat.h"
+ 
++#ifdef __ANDROID__
++#include <dlfcn.h>
++#include <cstdlib>
++#endif
++
+ namespace dxvk::vk {
+ 
++#ifdef __ANDROID__
++  /* A driver the user chose in the app (ME_GPU_DRIVER_DIR, ME_GPU_DRIVER_LIB), through libadrenotools
++     from ME_NATIVE_LIB_DIR. Null = the device's own driver, also when loading fails. */
++  static void* loadCustomDriver() {
++    const char* libDir = std::getenv("ME_NATIVE_LIB_DIR");
++    const char* driverDir = std::getenv("ME_GPU_DRIVER_DIR");
++    const char* driverLib = std::getenv("ME_GPU_DRIVER_LIB");
++
++    if (!libDir || !driverDir || !driverLib)
++      return nullptr;
++
++    using OpenFn = void* (*) (int, int, const char*, const char*, const char*, const char*, const char*, void**);
++
++    std::string hooks = str::format(libDir, "/");
++    void* tools = dlopen(str::format(hooks, "libadrenotools.so").c_str(), RTLD_NOW);
++    auto open = tools ? reinterpret_cast<OpenFn>(dlsym(tools, "adrenotools_open_libvulkan")) : nullptr;
++    void* vulkan = open ? open(RTLD_NOW, 1 /* ADRENOTOOLS_DRIVER_CUSTOM */, nullptr, hooks.c_str(), driverDir, driverLib, nullptr, nullptr) : nullptr;
++
++    if (vulkan)
++      Logger::info(str::format("Vulkan: custom driver ", driverDir, driverLib));
++    else
++      Logger::err(str::format("Vulkan: custom driver failed, using the device's own: ", dlerror() ? "dlopen error" : "unknown"));
++
++    return vulkan;
++  }
++#endif
++
+   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
++#ifdef __ANDROID__
++    if (void* custom = loadCustomDriver()) {
++      if (auto proc = dlsym(custom, "vkGetInstanceProcAddr"))
++        return std::make_pair(HMODULE(custom), reinterpret_cast<PFN_vkGetInstanceProcAddr>(proc));
++    }
++#endif
++
+     static const std::array<const char*, 2> dllNames = {{
+ #ifdef _WIN32
+       "winevulkan.dll",
+diff --git a/src/vulkan/vulkan_loader.h b/src/vulkan/vulkan_loader.h
+index 8ad6478..16a5813 100644
+--- a/src/vulkan/vulkan_loader.h
++++ b/src/vulkan/vulkan_loader.h
+@@ -9,6 +9,9 @@
+ #define VULKAN_FN(name) \
+   ::PFN_ ## name name = reinterpret_cast<::PFN_ ## name>(sym(#name))
+ 
++#define VULKAN_FN_KHR(name) \
++  ::PFN_ ## name name = reinterpret_cast<::PFN_ ## name>(sym(#name) ? sym(#name) : sym(#name "KHR"))
++
+ using PFN_wine_vkAcquireKeyedMutex = VkResult (VKAPI_PTR *)(VkDevice device, VkDeviceMemory memory, uint64_t key, uint32_t timeout_ms);
+ using PFN_wine_vkReleaseKeyedMutex = VkResult (VKAPI_PTR *)(VkDevice device, VkDeviceMemory memory, uint64_t key);
+ 
+@@ -260,7 +263,7 @@ namespace dxvk::vk {
+     VULKAN_FN(vkCreateFramebuffer);
+     VULKAN_FN(vkDestroyFramebuffer);
+     VULKAN_FN(vkCreateRenderPass);
+-    VULKAN_FN(vkCreateRenderPass2);
++    VULKAN_FN_KHR(vkCreateRenderPass2);
+     VULKAN_FN(vkDestroyRenderPass);
+     VULKAN_FN(vkGetRenderAreaGranularity);
+     VULKAN_FN(vkCreateCommandPool);
+@@ -275,10 +278,10 @@ namespace dxvk::vk {
+     VULKAN_FN(vkDestroyDescriptorUpdateTemplate);
+     VULKAN_FN(vkUpdateDescriptorSetWithTemplate);
+     VULKAN_FN(vkResetQueryPool);
+-    VULKAN_FN(vkGetBufferDeviceAddress);
+-    VULKAN_FN(vkGetSemaphoreCounterValue);
+-    VULKAN_FN(vkSignalSemaphore);
+-    VULKAN_FN(vkWaitSemaphores);
++    VULKAN_FN_KHR(vkGetBufferDeviceAddress);
++    VULKAN_FN_KHR(vkGetSemaphoreCounterValue);
++    VULKAN_FN_KHR(vkSignalSemaphore);
++    VULKAN_FN_KHR(vkWaitSemaphores);
+     VULKAN_FN(vkCmdBindPipeline);
+     VULKAN_FN(vkCmdSetViewport);
+     VULKAN_FN(vkCmdSetScissor);
+diff --git a/src/wsi/meson.build b/src/wsi/meson.build
+index 1d88e2c..9f8d98f 100644
+--- a/src/wsi/meson.build
++++ b/src/wsi/meson.build
+@@ -13,6 +13,7 @@ wsi_src = [
+   'glfw/wsi_monitor_glfw.cpp',
+   'glfw/wsi_platform_glfw.cpp',
+   'glfw/wsi_window_glfw.cpp',
++  'android/wsi_platform_android.cpp',
+ ]
+ 
+ wsi_deps = [ dep_displayinfo ]
+@@ -20,6 +21,8 @@ wsi_deps = [ dep_displayinfo ]
+ if platform == 'windows'
+   lib_setupapi = cpp.find_library('setupapi')
+   wsi_deps += [ lib_setupapi ]
++elif platform == 'android'
++  wsi_deps += [ cpp.find_library('android') ]
+ else
+   wsi_deps += [
+     lib_sdl3.partial_dependency(compile_args: true, includes: true),
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+index 08f456e..a12fa76 100644
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -20,6 +20,9 @@ namespace dxvk::wsi {
+ #endif
+ #if defined(DXVK_WSI_GLFW)
+     &GlfwWSI,
++#endif
++#if defined(DXVK_WSI_ANDROID)
++    &AndroidWSI,
+ #endif
+   };
+ 
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+index f1fae3f..97433d7 100644
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -123,6 +123,9 @@ namespace dxvk::wsi {
+ #if defined(DXVK_WSI_GLFW)
+   extern WsiBootstrap GlfwWSI;
+ #endif
++#if defined(DXVK_WSI_ANDROID)
++  extern WsiBootstrap AndroidWSI;
++#endif
+ 
+   void init();
+   void quit();

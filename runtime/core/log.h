@@ -3,6 +3,7 @@
 // <ID>_TRACE=1; warnings and fatal errors always print.
 
 #include <cstdio>
+#include <string>
 
 namespace recomp {
 
@@ -11,6 +12,13 @@ extern bool g_trace;
 // state, backtraces, the crash file); must not return. Without one,
 // FatalF prints the message and exits.
 extern void (*g_fatal_report)(const char* msg);
+extern void (*g_progress_report)(int percent, const char* item);
+extern void (*g_error_report)(const char* msg);
+extern void (*g_log_writer)(const char* msg);
+
+void ReportLoadingProgress(int percent, const char* item);
+void ReportFileOpen(const std::string& guest_path, bool exists);
+void ResetLoadingProgress();
 
 [[noreturn]] void FatalF(const char* fmt, ...)
     __attribute__((format(printf, 1, 2)));

@@ -156,6 +156,8 @@ void CallThunk(Ctx& c, gaddr thunk);
 // HLE_NAMED(dll, "export@8", ident, nargs) for decorated export names.
 #define HLE_NAMED(dll, export_name, ident, nargs) \
   HLE_NAMED_X(dll, export_name, ident, nargs, false)
+#define HLE64_NAMED(dll, export_name, ident, nargs) \
+  HLE_NAMED_X(dll, export_name, ident, nargs, true)
 #define HLE_NAMED_X(dll, export_name, ident, nargs, x64)                   \
   static uint64_t RECOMP_HLE_CAT(hle_, ident)(::recomp::Ctx & c);              \
   static ::recomp::hle::Registrar RECOMP_HLE_CAT(reg_, ident){                 \

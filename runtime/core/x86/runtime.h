@@ -147,6 +147,7 @@ void ReleaseThread(Thread* t);
 Process& StartProcess(const GameConfig& game, const std::string& game_dir, bool x64,
                       unsigned arena_bits = 0);
 void InitDispatch();
+uintptr_t LastFaultHostPc();
 uint32_t RunMainThread(Thread* t, const std::function<uint64_t(Ctx&)>& body);
 // For platforms whose guest has no UI thread of its own (consoles): body
 // runs as guest thread t on a host thread of its own, and the process

@@ -15,13 +15,24 @@ RecompiledFuncs/
 
 # Build & Tool outputs
 build/
+build_android/
 bin/
 obj/
 dist/
 *.o
 *.a
+*.apk
+*.keystore
 *.ninja
 .ninja_*
+__pycache__/
+
+# External DXVK build tree (tracked via patches/)
+dxvk-build/
+
+# Keep only GEMINI.md tracked in repo
+*.md
+!GEMINI.md
 
 # Lifted code (Auto-generated - keep out of repo or handle via gen pipeline)
 gen/

@@ -52,7 +52,11 @@ inline const char* HostFpProblem() {
 #elif defined(__aarch64__)
   // FZ (24), RMode (22-23), the trap enables IDE (15) and IXE..IOE
   // (8-12), and FEAT_AFP's NEP, AH and FIZ (0-2).
+#if defined(__BIONIC__) || defined(ANDROID)
+  if (env.__control & 0x01C09F07u) return "FPCR is not the default";
+#else
   if (env.__fpcr & 0x01C09F07u) return "FPCR is not the default";
+#endif
 #endif
   volatile double one = 1.0, tiny = 0x1p-1022, denormal = 0x1p-1060;
   if (one + 0x1p-53 != 1.0 || one + 0x1.8p-53 == 1.0 || -one - 0x1.8p-53 == -1.0)

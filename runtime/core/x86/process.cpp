@@ -62,15 +62,21 @@ void HoldThread(Thread* t) {
 // Host stack for each guest thread. Guest call depth maps 1:1 onto host
 // call depth, and lifted frames are larger than the originals, so be
 // generous; the memory is only touched as needed.
-constexpr size_t kHostStack = 256u << 20;
+constexpr size_t kHostStack = 16u << 20;
 
 }  // namespace
 
 Thread* CurrentThread() { return t_current; }
 
+bool IsGuestCommitted(uint64_t va) {
+  return g_proc && g_proc->mem.IsCommitted(va);
+}
+
+GuestMemory& GuestMem() { return g_proc->mem; }
+
 uint32_t GuestProcessorCount() {
   unsigned n = std::thread::hardware_concurrency();
-  return std::clamp<unsigned>(n, 2, 8);  // capped: 2002 code may assume few
+  return n > 0 ? n : 8; // Expose all device cores for multicore execution
 }
 
 bool Background() {
@@ -113,7 +119,9 @@ std::string GStr(gaddr va) {
 std::u16string GWStr(gaddr va) {
   std::u16string s;
   if (!va) return s;
-  for (;; va += 2) {
+  uint64_t arena_sz = g_proc ? g_proc->mem.size() : (1ULL << 36);
+  if (va >= arena_sz) return s;
+  for (size_t count = 0; count < 32768 && (va + 2) <= arena_sz; va += 2, ++count) {
     char16_t ch = Rd16(va);
     if (!ch) break;
     s.push_back(ch);
@@ -191,7 +199,7 @@ Thread* CreateGuestThread(uint64_t stack_size) {
   auto t = std::make_unique<Thread>();
   Process& p = *g_proc;
 
-  stack_size = std::max<uint64_t>(stack_size, 0x100000);
+  stack_size = std::max<uint64_t>(stack_size, 16u << 20);
   gaddr stack = p.vm.Reserve(0, stack_size);
   if (!stack) FatalF("cannot reserve a %llu byte guest stack", (unsigned long long)stack_size);
   p.vm.Commit(stack, stack_size, Prot::RW);

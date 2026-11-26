@@ -34,6 +34,36 @@ ucontext_t g_caller_ctx, g_stack_ctx;
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#if defined(__BIONIC__) || defined(ANDROID)
+#if defined(__aarch64__)
+void RunOnStack(void* stack, size_t size, void (*fn)()) {
+  uintptr_t new_sp = ((uintptr_t)stack + size) & ~15ULL;
+  __asm__ volatile (
+    "mov x19, sp\n"
+    "mov sp, %0\n"
+    "blr %1\n"
+    "mov sp, x19\n"
+    :
+    : "r"(new_sp), "r"(fn)
+    : "x19", "lr", "memory"
+  );
+}
+#else
+void RunOnStack(void* stack, size_t size, void (*fn)()) {
+  fn();
+}
+#endif
+
+struct Coroutine {
+  void (*fn)(void*) = nullptr;
+  void* arg = nullptr;
+};
+Coroutine* NewCoroutine(void* stack, size_t size, void (*fn)(void*), void* arg) { return new Coroutine{fn, arg}; }
+Coroutine* ThreadCoroutine() { return new Coroutine; }
+void SwitchCoroutine(Coroutine* from, Coroutine* to) { if (to && to->fn) to->fn(to->arg); }
+void FreeCoroutine(Coroutine* c) { delete c; }
+
+#else
 void RunOnStack(void* stack, size_t size, void (*fn)()) {
   getcontext(&g_stack_ctx);
   g_stack_ctx.uc_stack.ss_sp = stack;
@@ -84,6 +114,7 @@ void SwitchCoroutine(Coroutine* from, Coroutine* to) {
 }
 
 void FreeCoroutine(Coroutine* c) { delete c; }
+#endif
 #pragma clang diagnostic pop
 
 FaultContext ReadFaultContext(const void* uc) {
@@ -127,6 +158,13 @@ FaultContext ReadFaultContext(const void* uc) {
       break;
     }
     at += size;
+  }
+  if (!f.write_known && f.pc) {
+    uint32_t insn = 0;
+    memcpy(&insn, reinterpret_cast<const void*>(f.pc), 4);
+    // In ARM64 Load/Store register, bit 22 is 0 for Store (write) and 1 for Load (read)
+    f.write_known = true;
+    f.write = ((insn >> 22) & 1) == 0;
   }
 #elif defined(__APPLE__) && defined(__x86_64__)
   const auto& es = u->uc_mcontext->__es;

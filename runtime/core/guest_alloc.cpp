@@ -163,6 +163,38 @@ bool GuestAllocator::ReleaseRange(uint64_t va, uint64_t size, bool zero) {
 namespace {
 constexpr uint64_t kAlign = 16;
 constexpr uint64_t kDefaultSegment = 16u << 20;
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+// The object whose vtable becomes 0x100000000 lives here. Watch the heap's
+// Free/Alloc for it: GuestHeap recycles blocks without touching the pages, so
+// a use-after-free through the allocator is invisible to the write-watch.
+constexpr uint64_t kWatchObj = 0x10007B1A0ULL;
+}  // namespace
+
+// Set when the heap frees a block containing the watched object; read by the
+// dispatch site (which has the guest context) to report who uses it after.
+bool g_obj_freed = false;
+bool ObjWasFreed() { return g_obj_freed; }
+
+namespace {
+void LogHeapOp(const char* op, uint64_t addr, uint64_t size) {
+  if (addr <= kWatchObj + 0x80 && kWatchObj < addr + size) {
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "HEAP %s hits watched object: addr=0x%llX size=0x%llX",
+                        op, (unsigned long long)addr, (unsigned long long)size);
+  }
+}
+
+// The free that recycles the object's block is a use-after-free: UE3 frees it
+// and then uses it. The heap has no guest context, so the return chain cannot
+// be taken here; record that the block was freed and let the dispatch site
+// report who uses it.
+void NoteFree(uint64_t addr, uint64_t size) {
+  if (addr <= kWatchObj + 0x80 && kWatchObj < addr + size) g_obj_freed = true;
+}
 }  // namespace
 
 GuestHeap::GuestHeap(GuestAllocator& vm, uint64_t initial_size,
@@ -225,6 +257,7 @@ uint64_t GuestHeap::Alloc(uint64_t size, bool zero) {
     it = free_by_size_.lower_bound(size);
   }
   uint64_t addr = it->second, have = it->first;
+  LogHeapOp("alloc", addr, size);
   EraseFree(addr);
   if (have - size >= kAlign)
     InsertFree(addr + size, have - size);
@@ -240,6 +273,8 @@ bool GuestHeap::Free(uint64_t p) {
   auto it = used_.find(p);
   if (it == used_.end()) return false;
   uint64_t addr = p, size = it->second.size;
+  LogHeapOp("free", addr, size);
+  NoteFree(addr, size);
   used_.erase(it);
   // Coalesce with the following free block, unless it starts a segment.
   auto nx = free_.find(addr + size);

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "x86/runtime.h"
+#include "log.h"
 
 namespace recomp {
 
@@ -100,9 +101,30 @@ void OnDumpSignal(int) {
                     n, (unsigned long long)t_wd_hle_ret);
       WriteAll(fd, buf);
     }
+    if (Thread* cur = CurrentThread(); cur && g_proc) {
+      char buf[128];
+      uint64_t rsp = cur->ctx.rsp;
+      std::snprintf(buf, sizeof buf, "guest rsp=%08llX (stack [%08llX..%08llX))\n",
+                    (unsigned long long)rsp, (unsigned long long)cur->stack_lo,
+                    (unsigned long long)cur->stack_hi);
+      WriteAll(fd, buf);
+      if (rsp >= cur->stack_lo && rsp + 8 <= cur->stack_hi) {
+        for (uint64_t off = 0; off < 0x1000 && rsp + off + 8 <= cur->stack_hi; off += 8) {
+          uint64_t v = *g_proc->mem.ptr<uint64_t>(rsp + off);
+          if ((v >= 0x140000000ULL && v < 0x145000000ULL) ||
+              (v >= 0x180000000ULL && v < 0x185000000ULL)) {
+            std::snprintf(buf, sizeof buf, "  [rsp+%04llX] %016llX\n",
+                          (unsigned long long)off, (unsigned long long)v);
+            WriteAll(fd, buf);
+          }
+        }
+      }
+    }
     void* frames[512];
+#if !defined(ANDROID) && !defined(__ANDROID__)
     int n = backtrace(frames, 512);
     backtrace_symbols_fd(frames, n, fd);
+#endif
     g_dump_state.store(kDone);
   }
   errno = saved_errno;
@@ -126,6 +148,10 @@ void Dump(const char* what, double stalled) {
     std::snprintf(buf, sizeof buf, "\n=== thread %s (guest tid %04X) ===\n",
                   t.name.c_str(), t.tid);
     WriteAll(fd, buf);
+    if (pthread_equal(t.th, pthread_self())) {
+      WriteAll(fd, "(current thread - faulting)\n");
+      continue;
+    }
     g_dump_th.store(t.th);
     g_dump_state.store(kRequested);
     bool sent;
@@ -159,15 +185,25 @@ void Dump(const char* what, double stalled) {
                "warning: watchdog: %s for %.1f s; stacks of all guest threads "
                "written to %s\n",
                what, stalled, path.c_str());
+  WarnF("watchdog: %s for %.1f s; hang dump written to %s",
+        what, stalled, path.c_str());
 }
 
 void WatchdogMain() {
   int dumps = 0;
   int64_t last_dump = 0;
+  const int64_t startup_ms = NowMs();
+  bool startup_dumped = false;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     int64_t beat = g_beat.load(), frame = g_frame.load(), now = NowMs();
-    if (!beat || !frame) continue;  // not up yet
+    if (!beat || !frame) {
+      if (!startup_dumped && (now - startup_ms) >= 30000) {
+        startup_dumped = true;
+        Dump("startup stalled before first frame", (now - startup_ms) / 1000.0);
+      }
+      continue;  // not up yet
+    }
     // Either the main thread stopped servicing the window system, or it
     // still does (e.g. in MsgWaitForMultipleObjects) but no frame has
     // been presented: a game-level deadlock behind a responsive window.
@@ -192,6 +228,10 @@ void WatchdogMain() {
 
 }  // namespace
 
+void DumpAllGuestThreads(const char* what) {
+  Dump(what, 0.0);
+}
+
 void StartWatchdog() {
   // backtrace() loads libgcc on first use, which must not happen inside
   // the signal handler.
@@ -199,7 +239,7 @@ void StartWatchdog() {
   backtrace(f, 2);
   struct sigaction sa{};
   sa.sa_handler = OnDumpSignal;
-  sa.sa_flags = SA_RESTART;
+  sa.sa_flags = SA_RESTART | SA_ONSTACK;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGUSR2, &sa, nullptr);
   std::thread(WatchdogMain).detach();

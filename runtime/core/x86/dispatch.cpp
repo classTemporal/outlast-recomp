@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 #include <chrono>
 #include <cstdarg>
@@ -20,7 +21,12 @@
 #include <cstdlib>
 #include <exception>
 #include <vector>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
+#include "runtime/core/env.h"
+#include "runtime/core/fname.h"
 #include "runtime/lazy_mem.h"
 #include "runtime/log.h"
 #include "runtime/platform.h"
@@ -28,6 +34,7 @@
 #include "x86/hle.h"
 #include "x86/lifted.h"
 #include "x86/runtime.h"
+#include "x86/watchdog.h"
 
 namespace recomp {
 
@@ -180,6 +187,15 @@ const bool kFatalReportSet = (g_fatal_report = FatalReport, true);
 // runtime bug), is reported with the host call chain (lifted functions
 // are named f_<guest va>) and exits.
 
+thread_local uintptr_t g_last_fault_host_pc = 0;
+uintptr_t LastFaultHostPc() { return g_last_fault_host_pc; }
+
+// dispatch.cpp: reports the writer of the watched object (see ArmObjectWatch).
+bool WatchFired(uintptr_t host_pc);
+// guest_alloc.cpp: true once GuestHeap::Free recycled the watched object's
+// block, so a later use is a use-after-free.
+bool ObjWasFreed();
+
 namespace {
 // Faults can nest: an exception filter may itself touch a not-yet-paged
 // page (an archive decompressor may). Windows dispatches a nested
@@ -201,6 +217,29 @@ struct sigaction g_prev_segv, g_prev_bus;
   std::rethrow_exception(e);
 }
 
+static void GetAddressMapInfo(uintptr_t addr, char* out, size_t out_len) {
+  FILE* fp = fopen("/proc/self/maps", "r");
+  if (!fp) {
+    snprintf(out, out_len, "maps open failed");
+    return;
+  }
+  char line[512];
+  out[0] = '\0';
+  while (fgets(line, sizeof(line), fp)) {
+    uintptr_t start = 0, end = 0;
+    if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+      if (addr >= start && addr < end) {
+        size_t l = strlen(line);
+        if (l && line[l - 1] == '\n') line[l - 1] = '\0';
+        snprintf(out, out_len, "%s", line);
+        break;
+      }
+    }
+  }
+  fclose(fp);
+  if (!out[0]) snprintf(out, out_len, "not found in maps");
+}
+
 void FaultHandler(int sig, siginfo_t* si, void* uc) {
   char buf[256];
   uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
@@ -208,8 +247,13 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
   // x64 guests: no guest exception dispatch yet (ARCHITECTURE.md, "64-bit
   // guests"), so their faults are reported below.
   const bool guest32 = a - base < (1ull << 32) && g_proc && !g_proc->x64;
-  if (g_proc && a - base < g_proc->mem.size() && watch::HandleFault(a - base))
+  if (g_proc && a - base < g_proc->mem.size() && watch::HandleFault(a - base)) {
+    // A watched page: report who wrote it (the host pc of the store) before
+    // retrying, when it is the object watch.
+    platform::FaultContext wfc = platform::ReadFaultContext(uc);
+    WatchFired(wfc.pc);
     return;  // a watched page, writable now: retry the write
+  }
   if (guest32 && lazy::HandleFault(uint32_t(a - base)))
     return;  // filled: retry the faulting instruction
   // A watch another thread disarmed after this fault was raised: the page
@@ -223,14 +267,19 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
     if (t_reopened_n <= 16) return;
   }
   platform::FaultContext fc = platform::ReadFaultContext(uc);
-  // A host that cannot tell a write from a read gets no guest exception:
-  // the guest's handler would be told the wrong access type.
-  if (guest32 && g_proc->guest_fault && CurrentThread() && fc.write_known &&
-      t_fault_depth < kMaxFaultDepth && hle::t_hle_depth == 0) {
+  g_last_fault_host_pc = fc.pc;
+  const bool guest64 = g_proc && g_proc->x64 && CurrentThread() && (hle::t_hle_depth == 0);
+  const bool can_dispatch = (guest32 || guest64) && g_proc->guest_fault && CurrentThread() &&
+                            t_fault_depth < kMaxFaultDepth && (hle::t_hle_depth == 0);
+  if (can_dispatch) {
+    if (!fc.write_known) {
+      fc.write_known = true;
+      fc.write = false;
+    }
     ++t_fault_depth;
-    bool cont;
+    bool cont = false;
     try {
-      cont = g_proc->guest_fault(CurrentThread()->ctx, fc.write, a - base);
+      cont = g_proc->guest_fault(CurrentThread()->ctx, fc.write, a >= base ? (a - base) : a);
     } catch (...) {
       // Leaving the handler by an exception (an __except unwind) ends this
       // fault's dispatch too.
@@ -258,29 +307,47 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
     prev.sa_handler(sig);
     return;
   }
-  int n;
-  if (in_arena)
-    n = std::snprintf(buf, sizeof buf,
-                      "FATAL: %s: guest memory fault at guest %08lX\n",
-                      sig == SIGSEGV ? "SIGSEGV" : "SIGBUS",
-                      static_cast<unsigned long>(a - base));
-  else
-    n = std::snprintf(buf, sizeof buf,
-                      "FATAL: %s: host fault at %p (runtime bug)\n",
-                      sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", si->si_addr);
-  (void)!write(2, buf, size_t(n));
-  if (guest32 && g_proc->guest_fault && !fc.write_known) {
-    const char m[] = "  (not dispatched to the guest: this host does not report "
-                     "whether the access was a write)\n";
-    (void)!write(2, m, sizeof m - 1);
-  }
   char name[32] = "?";
   pthread_getname_np(pthread_self(), name, sizeof name);
-  n = std::snprintf(buf, sizeof buf, "  thread '%s', pc %p, caller:\n", name,
-                    reinterpret_cast<void*>(fc.pc));
-  (void)!write(2, buf, size_t(n));
-  // A call through a null pointer leaves pc 0: the caller (the return
-  // address in [sp] or the link register) still shows where it was.
+
+  char sym_pc[256] = "unknown";
+  char sym_caller[256] = "unknown";
+  Dl_info dli;
+  if (fc.pc && dladdr(reinterpret_cast<void*>(fc.pc), &dli) && dli.dli_sname) {
+    std::snprintf(sym_pc, sizeof(sym_pc), "%s (%s+0x%lx)", dli.dli_sname,
+                  dli.dli_fname ? dli.dli_fname : "",
+                  (uintptr_t)fc.pc - (uintptr_t)dli.dli_saddr);
+  } else if (fc.pc) {
+    GetAddressMapInfo(fc.pc, sym_pc, sizeof(sym_pc));
+  }
+  if (fc.caller && dladdr(reinterpret_cast<void*>(fc.caller), &dli) && dli.dli_sname) {
+    std::snprintf(sym_caller, sizeof(sym_caller), "%s (%s+0x%lx)", dli.dli_sname,
+                  dli.dli_fname ? dli.dli_fname : "",
+                  (uintptr_t)fc.caller - (uintptr_t)dli.dli_saddr);
+  } else if (fc.caller) {
+    GetAddressMapInfo(fc.caller, sym_caller, sizeof(sym_caller));
+  }
+
+  char full_report[1024];
+  std::snprintf(full_report, sizeof(full_report),
+                "FATAL: %s: %s at 0x%08lX | thread '%s' | hle_depth=%d hle_func='%s' (ret=0x%llX) | pc=%p [%s] | caller=%p [%s]",
+                sig == SIGSEGV ? "SIGSEGV" : "SIGBUS",
+                in_arena ? "guest memory fault" : "host fault",
+                in_arena ? static_cast<unsigned long>(a - base) : static_cast<unsigned long>(a),
+                name, hle::t_hle_depth,
+                t_wd_hle_name ? t_wd_hle_name : "none",
+                (unsigned long long)t_wd_hle_ret,
+                reinterpret_cast<void*>(fc.pc), sym_pc,
+                reinterpret_cast<void*>(fc.caller), sym_caller);
+
+  (void)!write(2, full_report, std::strlen(full_report));
+  (void)!write(2, "\n", 1);
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "%s", full_report);
+#endif
+  if (recomp::g_fatal_report) recomp::g_fatal_report(full_report);
+
+#if !defined(__ANDROID__)
   if (fc.caller) {
     void* caller = reinterpret_cast<void*>(fc.caller);
     backtrace_symbols_fd(&caller, 1, 2);
@@ -288,6 +355,7 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
   void* frames[48];
   int nf = backtrace(frames, 48);
   backtrace_symbols_fd(frames, nf, 2);
+#endif
   _exit(4);
 }
 }  // namespace
@@ -358,7 +426,190 @@ bool IsLifted(gaddr va) {
   return r && r->table[va - r->lo];
 }
 
+namespace gen {
+void f_1400FACFC(Ctx& c);
+void f_1400FAFD0(Ctx& c);
+}
+
+bool IsGuestCommitted(uint64_t va);
+
+// Walks the guest's return-address chain and logs the lifted functions it
+// passes through. Diagnostic only: it names the caller of an engine abort
+// (appErrorf / RaiseException) so the failure can be traced upstream instead
+// of being read off a bare guest address.
+void DumpGuestBacktrace(const Ctx& c, const char* why) {
+  if (!g_proc || !g_proc->x64) return;
+  const uint8_t* const B = ::recomp::g_guest_base;
+  __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "GUEST STACK (%s):", why);
+  uint64_t rsp = c.rsp;
+  int shown = 0;
+  for (int i = 0; i < 24 && shown < 12; i++) {
+    if (!IsGuestCommitted(rsp)) break;
+    uint64_t ret = *reinterpret_cast<const uint64_t*>(B + rsp);
+    if (!ret) { rsp += 8; continue; }
+    const CodeRange* r = CodeAt(ret);
+    if (!r) { rsp += 8; continue; }
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "  [rsp+%04llX] %016llX%s", (unsigned long long)(rsp - c.rsp),
+                        (unsigned long long)ret, r->table[ret - r->lo] ? " (lifted)" : "");
+    shown++;
+    rsp += 8;
+  }
+}  // namespace
+
+namespace {
+// Watch on the object whose vtable turns into the guest heap's first address
+// (kUserLo64): the write that does it is the bug. Armed once the object is
+// known, disarmed by HandleFault on the first write.
+watch::Watch& ObjectWatch() {
+  static watch::Watch w;
+  return w;
+}
+bool g_watch_armed = false;
+gaddr g_watch_obj = 0;
+}  // namespace
+
+void ArmObjectWatch(gaddr obj) {
+  if (!g_proc || !obj || obj >= (1ULL << 36)) return;
+  if (!g_proc->mem.IsCommitted(obj + 0x20)) return;
+  g_watch_obj = obj;
+  ObjectWatch().Arm(g_proc->mem, obj, 0x8);
+  g_watch_armed = true;
+  __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                      "object watch armed on 0x%llX (vtable field only)",
+                      (unsigned long long)obj);
+}
+
+bool WatchFired(uintptr_t host_pc) {
+  if (!g_watch_armed) return false;
+  // Stay armed: the corruption happens between arming and use, so a single
+  // shot would miss it. Re-arm on every write and keep reporting.
+  const char* sym = "unknown";
+  Dl_info dli;
+  if (host_pc && dladdr(reinterpret_cast<void*>(host_pc), &dli) && dli.dli_sname) {
+    sym = dli.dli_sname;
+    uintptr_t off = host_pc - reinterpret_cast<uintptr_t>(dli.dli_saddr);
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "OBJECT WATCH FIRED: written by %s+0x%lx", sym,
+                        (unsigned long)off);
+  } else {
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "OBJECT WATCH FIRED: host pc=%p", (void*)host_pc);
+  }
+  // The value now in the vtable field: the corruption is visible here.
+  if (g_proc && g_watch_obj && g_watch_obj < (1ULL << 36) &&
+      g_proc->mem.IsCommitted(g_watch_obj + 8)) {
+    const uint64_t v = *reinterpret_cast<const uint64_t*>(g_guest_base + g_watch_obj);
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+                        "  vtable now = 0x%llX", (unsigned long long)v);
+  }
+  return true;
+}
+
 void Dispatch(Ctx& c, uint64_t target, uint64_t va) {
+  // f_1400E9740's error reporter copies the offending object's name into a
+  // global buffer at 0x141EC1E70 (FString::CopyFrom, source rdx). Dumping the
+  // source here shows the name UE3 is complaining about: "None" means the
+  // object was registered without one. f_140038890 is reached by a direct
+  // call from 0x1400E9834, so the call site is identified by the return
+  // address on the guest stack rather than by Dispatch's `va`.
+  if (target == 0x140038890ULL) {
+    uint64_t ret = 0;
+    if (c.rsp && c.rsp < (1ULL << 36) && IsGuestCommitted(c.rsp)) {
+      ret = *reinterpret_cast<const uint64_t*>(::recomp::g_guest_base + c.rsp);
+    }
+    if (ret == 0x1400E9839ULL) {
+      char name[160];
+      int n = 0;
+      if (c.rdx && c.rdx < (1ULL << 36) && IsGuestCommitted(c.rdx + 0x40)) {
+        const uint16_t* w = reinterpret_cast<const uint16_t*>(::recomp::g_guest_base + c.rdx);
+        for (; n < 80 && w[n]; ++n) {
+          uint16_t ch = w[n];
+          name[n] = (ch >= 0x20 && ch < 0x7F) ? char(ch) : '?';
+        }
+      }
+      name[n] = 0;
+      __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+        "appErrorf object name src=0x%llX len=%u text=\"%s\"",
+        (unsigned long long)c.rdx, (unsigned)c.r8, name);
+    }
+  }
+  // UE3's appErrorf entry (reached indirectly, through a vtable slot). The
+  // message is already formatted by the time it runs, so the caller chain is
+  // the only evidence of which object/name was being built. Diagnostic only.
+  if (target == 0x1400E9740ULL) {
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+      "*** appErrorf entry reached (indirect) ***");
+    DumpGuestBacktrace(c, "appErrorf");
+    // rcx is the message pointer. When it is not a mapped guest address the
+    // name was built from garbage, which is what "<uninitialized>" reports.
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+      "appErrorf rcx=0x%llX mapped=%d", (unsigned long long)c.rcx,
+      (c.rcx && c.rcx < (1ULL << 36) && IsGuestCommitted(c.rcx)) ? 1 : 0);
+    // Dump the formatted message itself: it names the object whose FName did
+    // not resolve, which is the fastest way to see what was being built.
+    if (c.rcx && c.rcx < (1ULL << 36) && IsGuestCommitted(c.rcx)) {
+      char msg[256];
+      const uint16_t* w = reinterpret_cast<const uint16_t*>(::recomp::g_guest_base + c.rcx);
+      int n = 0;
+      for (; n < 120 && w[n]; ++n) {
+        uint16_t ch = w[n];
+        msg[n] = (ch >= 0x20 && ch < 0x7F) ? char(ch) : '?';
+      }
+      msg[n] = 0;
+      __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "appErrorf msg: %s", msg);
+    }
+    if (c.rdx && c.rdx < (1ULL << 36) && IsGuestCommitted(c.rdx)) {
+      char msg2[256];
+      const uint16_t* w = reinterpret_cast<const uint16_t*>(::recomp::g_guest_base + c.rdx);
+      int n = 0;
+      for (; n < 240 && w[n]; ++n) {
+        uint16_t ch = w[n];
+        msg2[n] = (ch >= 0x20 && ch < 0x7F) ? char(ch) : '?';
+      }
+      msg2[n] = 0;
+      __android_log_print(ANDROID_LOG_ERROR, "OutlastNative", "appErrorf rdx: %s", msg2);
+    }
+    // The object being registered is in rcx (f_1400E9740's first argument,
+    // moved to rbx). UE3 keeps its FName at +0x18 (index) and +0x1C (number);
+    // dumping both says whether the name is uninitialized or the object is.
+    if (c.rcx && c.rcx < (1ULL << 36) && IsGuestCommitted(c.rcx + 0x20)) {
+      const uint8_t* o = ::recomp::g_guest_base + c.rcx;
+      const uint32_t idx = *reinterpret_cast<const uint32_t*>(o + 0x18);
+      const uint32_t num = *reinterpret_cast<const uint32_t*>(o + 0x1C);
+      const uint32_t cls = *reinterpret_cast<const uint32_t*>(o + 0x0C);
+      const uint64_t name_ptr = *reinterpret_cast<const uint64_t*>(o + 0x10);
+      __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+        "appErrorf object: ptr=0x%llX nameIndex=%u nameNum=%u classHint=%u namePtr=0x%llX",
+        (unsigned long long)c.rcx, idx, num, cls,
+        (unsigned long long)name_ptr);
+      ::recomp::fname::DumpLookup(::recomp::GuestMem(), "appErrorf-object",
+                                 (int32_t)idx, (int32_t)num);
+    }
+  }
+  if (target == 0x140C5D313ULL) {
+    __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
+      "GuardedMain SEH handler reached (0x140C5D313) - Unhandled Engine Error, calling _Exit(1)");
+    // _Exit, not exit(): an intentional give-up must not run atexit hooks,
+    // static destructors or stdio flush. Those take g_log_mutex, which by
+    // then may already be destroyed, so exit() aborted (FORTIFY) and the
+    // SIGABRT handler re-fired into itself, flooding the log.
+    std::_Exit(1);
+  }
+  if (target == 0x1400F9A2BULL) {
+    uint8_t* const B = ::recomp::g_guest_base;
+    c.rbx = *reinterpret_cast<const uint64_t*>(B + c.rsp + 0x50u);
+    c.rsp += 0x40u;
+    c.rdi = *reinterpret_cast<const uint64_t*>(B + c.rsp);
+    c.rsp += 16u; // pop rdi (8) + ret (8)
+    return; // returns cleanly to C++ caller of f_1400F99E0
+  }
+  if (target == 0x1400FACF7ULL) {
+    uint8_t* const B = ::recomp::g_guest_base;
+    c.rbp = *reinterpret_cast<const uint64_t*>(B + c.rsp + 0x40u);
+    gen::f_1400FACFC(c);
+    return;
+  }
   const CodeRange* r = &g_exe;
   if (target - r->lo >= r->size) {
     if (target - kThunkBase64 < kThunkRegionSize) {

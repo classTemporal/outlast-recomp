@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "runtime/core/guest_memory.h"
 #include "x86/ctx.h"
 #include "x86/sse.h"
 #include "x86/x87.h"
@@ -51,6 +52,10 @@ void Dispatch(Ctx& c, uint32_t target, uint32_t va);
 // Dispatches to r.target, and again for each later GuestResume into the
 // same frame (r.ebp) thrown while that continuation runs.
 void Resume(Ctx& c, GuestResume r);
+// Logs the guest's return-address chain (see dispatch.cpp). Diagnostic.
+void DumpGuestBacktrace(const Ctx& c, const char* why);
+// The guest's memory, for lifted code's own diagnostics (fname lookups).
+GuestMemory& GuestMem();
 #ifndef RECOMP_LIFT_X64
 [[noreturn]] void Unimplemented(Ctx& c, uint32_t va, const char* what);
 [[noreturn]] void BadJump(Ctx& c, uint32_t va, uint32_t target);
@@ -63,6 +68,7 @@ void Dispatch(Ctx& c, uint64_t target, uint64_t va);
 [[noreturn]] void Unimplemented(Ctx& c, uint64_t va, const char* what);
 [[noreturn]] void BadJump(Ctx& c, uint64_t va, uint64_t target);
 [[noreturn]] void Unreachable(Ctx& c, uint64_t va);
+bool IsGuestCommitted(uint64_t va);
 void Trap(Ctx& c, uint64_t va);
 void RaiseDivideError(Ctx& c, uint64_t va);
 void Probe(Ctx& c, uint64_t va, const char* name);
