@@ -16,6 +16,7 @@
 #include "win32/process.h"
 #include "win32/win32.h"
 #include "win32/msvcr100.h"
+#include "win32/android_input.h"
 #include "runtime/log.h"
 
 #define LOG_TAG "OutlastJNI"
@@ -24,6 +25,8 @@
 
 static std::string g_log_path = "";
 static std::string g_crash_path = "";
+static FILE* g_log_fp = nullptr;
+static uint32_t g_verbose_log_count = 0;
 static bool g_verbose_logs = false;
 static std::mutex g_log_mutex;
 
@@ -133,14 +136,18 @@ static void EnsureDir(const std::string& path) {
 
 static void WriteLog(const char* msg, bool is_verbose = false) {
     if (is_verbose && !g_verbose_logs) return;
-    LOGI("%s", msg);
+    if (!is_verbose || (g_verbose_log_count & 0x1F) == 0) {
+        LOGI("%s", msg);
+    }
     std::lock_guard<std::mutex> lock(g_log_mutex);
-    if (!g_log_path.empty()) {
-        FILE* fp = std::fopen(g_log_path.c_str(), "a");
-        if (fp) {
-            std::fprintf(fp, "%s\n", msg);
-            std::fflush(fp);
-            std::fclose(fp);
+    if (!g_log_fp && !g_log_path.empty()) {
+        g_log_fp = std::fopen(g_log_path.c_str(), "a");
+        if (g_log_fp) std::setvbuf(g_log_fp, nullptr, _IOFBF, 64 * 1024);
+    }
+    if (g_log_fp) {
+        std::fprintf(g_log_fp, "%s\n", msg);
+        if (!is_verbose || (++g_verbose_log_count & 0x1FF) == 0) {
+            std::fflush(g_log_fp);
         }
     }
 }
@@ -171,6 +178,67 @@ static void OnFatalEngineError(const char* msg) {
 extern "C" {
 
 JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_updateNativeSurface(JNIEnv* env, jclass, jobject surface) {
+    ANativeWindow* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    recomp::SetAndroidNativeWindow(window);
+    if (window) ANativeWindow_release(window);
+    LOGI("Android surface %s", surface ? "available" : "destroyed");
+}
+
+JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_sendNativeGamepad(JNIEnv*, jclass, jint button, jboolean down) {
+    if (button > 0 && button <= 0xffff) {
+        recomp::android_input::SetGamepadButton(uint16_t(button), down == JNI_TRUE);
+        LOGI("Input: XInput button=0x%04x down=%d", button, down == JNI_TRUE);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_sendNativeGamepadAxes(
+    JNIEnv*, jclass, jint lt, jint rt, jint lx, jint ly, jint rx, jint ry) {
+    auto clamp8 = [](jint v) -> uint8_t { return uint8_t(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+    auto clamp16 = [](jint v) -> int16_t { return int16_t(v < -32768 ? -32768 : (v > 32767 ? 32767 : v)); };
+    recomp::android_input::SetGamepadAxes(
+        clamp8(lt), clamp8(rt), clamp16(lx), clamp16(ly), clamp16(rx), clamp16(ry));
+}
+
+JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_sendNativeTouch(JNIEnv*, jclass, jint x, jint y, jint action) {
+    recomp::android_input::SetMouse(x, y, action);
+    if (action != 0) LOGI("Input: touch x=%d y=%d action=%d", x, y, action);
+}
+
+JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_sendNativeKey(JNIEnv*, jclass, jint scan, jint vk, jboolean down) {
+    if (scan > 0 && scan < 256 && vk > 0 && vk < 256) {
+        LOGI("Input: scan=0x%02x vk=0x%02x down=%d", scan, vk, down == JNI_TRUE);
+        recomp::android_input::SetKey(uint8_t(scan), uint8_t(vk), down == JNI_TRUE);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_tapps_outrecomp_GameActivity_releaseNativeKeys(JNIEnv*, jclass) {
+    recomp::android_input::ReleaseKeys();
+    std::lock_guard<std::mutex> lock(recomp::android_input::gamepad.mutex);
+    if (recomp::android_input::gamepad.buttons ||
+        recomp::android_input::gamepad.left_trigger ||
+        recomp::android_input::gamepad.right_trigger ||
+        recomp::android_input::gamepad.thumb_lx ||
+        recomp::android_input::gamepad.thumb_ly ||
+        recomp::android_input::gamepad.thumb_rx ||
+        recomp::android_input::gamepad.thumb_ry) {
+        recomp::android_input::gamepad.buttons = 0;
+        recomp::android_input::gamepad.left_trigger = 0;
+        recomp::android_input::gamepad.right_trigger = 0;
+        recomp::android_input::gamepad.thumb_lx = 0;
+        recomp::android_input::gamepad.thumb_ly = 0;
+        recomp::android_input::gamepad.thumb_rx = 0;
+        recomp::android_input::gamepad.thumb_ry = 0;
+        ++recomp::android_input::gamepad.packet;
+    }
+}
+
+JNIEXPORT void JNICALL
 Java_com_tapps_outrecomp_GameActivity_initNativeLogging(JNIEnv* env, jclass clazz, jstring log_path, jboolean verbose) {
     g_verbose_logs = (verbose == JNI_TRUE);
     recomp::g_trace = g_verbose_logs;
@@ -190,6 +258,10 @@ Java_com_tapps_outrecomp_GameActivity_initNativeLogging(JNIEnv* env, jclass claz
             g_crash_path = "crash.log";
         }
 
+        if (g_log_fp) {
+            std::fclose(g_log_fp);
+            g_log_fp = nullptr;
+        }
         FILE* fp = std::fopen(g_log_path.c_str(), "w");
         if (fp) {
             std::fprintf(fp, "=====================================================\n");
@@ -200,7 +272,8 @@ Java_com_tapps_outrecomp_GameActivity_initNativeLogging(JNIEnv* env, jclass claz
             std::fprintf(fp, " Engine: Unreal Engine 3 (Lifted AOT Recompilation)\n");
             std::fprintf(fp, "=====================================================\n");
             std::fflush(fp);
-            std::fclose(fp);
+            std::setvbuf(fp, nullptr, _IOFBF, 64 * 1024);
+            g_log_fp = fp;
         }
         env->ReleaseStringUTFChars(log_path, path_str);
     }
@@ -232,11 +305,6 @@ Java_com_tapps_outrecomp_GameActivity_startNativeEngine(
     recomp::g_log_writer = [](const char* msg) { WriteLog(msg); };
     recomp::InstallCrashSignalHandlers();
 
-    ANativeWindow* window = nullptr;
-    if (surface) {
-        window = ANativeWindow_fromSurface(env, surface);
-        recomp::SetAndroidNativeWindow(window);
-    }
     const char* dir_str = env->GetStringUTFChars(game_dir, nullptr);
     std::string s_dir = dir_str ? dir_str : "";
     if (dir_str) env->ReleaseStringUTFChars(game_dir, dir_str);
@@ -254,11 +322,13 @@ Java_com_tapps_outrecomp_GameActivity_startNativeEngine(
     std::snprintf(buf, sizeof(buf), "[*] Verbose Logging Mode: %s", g_verbose_logs ? "TRUE" : "FALSE");
     WriteLog(buf);
 
+    ANativeWindow* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
     if (window) {
         int width = ANativeWindow_getWidth(window);
         int height = ANativeWindow_getHeight(window);
         std::snprintf(buf, sizeof(buf), "[*] Native Window acquired: %dx%d", width, height);
         WriteLog(buf);
+        ANativeWindow_release(window);
     } else {
         WriteLog("[!] Warning: Failed to obtain ANativeWindow from Surface");
     }

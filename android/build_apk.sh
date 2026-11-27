@@ -51,6 +51,7 @@ javac --release 8 -classpath "$PLATFORM" \
     "$SRC_DIR/src/com/tapps/outrecomp/CrashHandler.java" \
     "$SRC_DIR/src/com/tapps/outrecomp/OutlastApp.java" \
     "$SRC_DIR/src/com/tapps/outrecomp/LauncherActivity.java" \
+    "$SRC_DIR/src/com/tapps/outrecomp/VirtualGamepadView.java" \
     "$SRC_DIR/src/com/tapps/outrecomp/GameActivity.java"
 
 echo "=== 4. Packaging JAR and converting to DEX with D8 ==="

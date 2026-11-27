@@ -14,6 +14,8 @@
 #include <cstring>
 #include <cwchar>
 #include <cctype>
+#include <cmath>
+#include <algorithm>
 #include <ctime>
 #include <sys/time.h>
 #include <utime.h>
@@ -27,12 +29,42 @@ namespace recomp::win32 {
 
 using namespace recomp::hle;
 
-struct GuestArgs {
-  gaddr p;
+struct ArgSource {
+  const Ctx* ctx = nullptr;
+  int ctx_idx = 0;
+  gaddr va_ptr = 0;
+  bool is_va = false;
+
+  static ArgSource FromVa(gaddr va) {
+    ArgSource s;
+    s.va_ptr = va;
+    s.is_va = true;
+    return s;
+  }
+  static ArgSource FromCtx(const Ctx& c, int first_idx) {
+    ArgSource s;
+    s.ctx = &c;
+    s.ctx_idx = first_idx;
+    s.is_va = false;
+    return s;
+  }
+
   uint64_t Next() {
-    uint64_t v = Rd64(p);
-    p += 8;
-    return v;
+    if (is_va) {
+      uint64_t v = Rd64(va_ptr);
+      va_ptr += 8;
+      return v;
+    }
+    return Arg(*ctx, ctx_idx++);
+  }
+  double NextD() {
+    if (is_va) {
+      uint64_t b = Next();
+      double d;
+      std::memcpy(&d, &b, 8);
+      return d;
+    }
+    return ArgD(*ctx, ctx_idx++);
   }
 };
 
@@ -698,264 +730,458 @@ HLE64("msvcr100.dll", fgets, kCdecl) {
   return res ? buf : 0;
 }
 
+namespace {
+
+std::string FormatHostOne(const std::string& spec, auto v) {
+  int n = std::snprintf(nullptr, 0, spec.c_str(), v);
+  if (n <= 0) return {};
+  std::string r(size_t(n), '\0');
+  std::snprintf(r.data(), size_t(n) + 1, spec.c_str(), v);
+  return r;
+}
+
+std::string PadStr(const std::string& body, int width, bool left) {
+  if (width <= 0 || int(body.size()) >= width) return body;
+  std::string pad(size_t(width - int(body.size())), ' ');
+  return left ? (body + pad) : (pad + body);
+}
+
+std::string FormatGuestPrintf(const std::string& fmt, ArgSource& a, bool default_wide) {
+  std::string out;
+  for (size_t i = 0; i < fmt.size(); i++) {
+    if (fmt[i] != '%') {
+      out.push_back(fmt[i]);
+      continue;
+    }
+    size_t start = i++;
+    if (i >= fmt.size()) {
+      out.push_back('%');
+      break;
+    }
+    if (fmt[i] == '%') {
+      out.push_back('%');
+      continue;
+    }
+    std::string flags;
+    while (i < fmt.size() && std::strchr("-+ #0", fmt[i])) flags.push_back(fmt[i++]);
+    int width = -1, prec = -1;
+    if (i < fmt.size() && fmt[i] == '*') {
+      width = int32_t(a.Next());
+      if (width < 0) {
+        flags.push_back('-');
+        width = -width;
+      }
+      i++;
+    } else {
+      while (i < fmt.size() && std::isdigit(uint8_t(fmt[i]))) {
+        width = (width < 0 ? 0 : width) * 10 + (fmt[i++] - '0');
+      }
+    }
+    if (i < fmt.size() && fmt[i] == '.') {
+      i++;
+      if (i < fmt.size() && fmt[i] == '*') {
+        prec = int32_t(a.Next());
+        i++;
+      } else {
+        prec = 0;
+        while (i < fmt.size() && std::isdigit(uint8_t(fmt[i]))) {
+          prec = prec * 10 + (fmt[i++] - '0');
+        }
+      }
+    }
+    int bits = 32;
+    bool wide = default_wide;
+    bool narrow = !default_wide;
+    for (;;) {
+      if (i >= fmt.size()) break;
+      char ch = fmt[i];
+      if (ch == 'h') {
+        bits = (i + 1 < fmt.size() && fmt[i + 1] == 'h') ? (i++, 8) : 16;
+        narrow = true;
+        wide = false;
+        i++;
+      } else if (ch == 'l') {
+        if (i + 1 < fmt.size() && fmt[i + 1] == 'l') {
+          bits = 64;
+          i += 2;
+        } else {
+          wide = true;
+          narrow = false;
+          i++;
+        }
+      } else if (ch == 'L' || ch == 'j' || ch == 'z' || ch == 't') {
+        bits = 64;
+        i++;
+      } else if (ch == 'w') {
+        wide = true;
+        narrow = false;
+        i++;
+      } else if (ch == 'I') {
+        if (fmt.compare(i, 3, "I64") == 0) {
+          bits = 64;
+          i += 3;
+        } else if (fmt.compare(i, 3, "I32") == 0) {
+          bits = 32;
+          i += 3;
+        } else {
+          bits = 64;
+          i++;
+        }
+      } else {
+        break;
+      }
+    }
+    if (i >= fmt.size()) {
+      out += fmt.substr(start);
+      break;
+    }
+    char conv = fmt[i];
+    std::string spec = "%" + flags + (width >= 0 ? std::to_string(width) : "") +
+                       (prec >= 0 ? "." + std::to_string(prec) : "");
+    bool left = flags.find('-') != std::string::npos;
+    switch (conv) {
+      case 'd': case 'i': {
+        uint64_t v = a.Next();
+        long long s = (bits == 64) ? int64_t(v) : (bits == 16) ? int16_t(v) : (bits == 8) ? int8_t(v) : int32_t(v);
+        out += FormatHostOne(spec + "lld", s);
+        break;
+      }
+      case 'u': case 'o': case 'x': case 'X': {
+        uint64_t v = a.Next();
+        unsigned long long u = (bits == 64) ? v : (bits == 16) ? uint16_t(v) : (bits == 8) ? uint8_t(v) : uint32_t(v);
+        out += FormatHostOne(spec + "ll" + conv, u);
+        break;
+      }
+      case 'p': {
+        out += PadStr(FormatHostOne("%016llX", (unsigned long long)a.Next()), width, left);
+        break;
+      }
+      case 'c': case 'C': {
+        uint64_t v = a.Next();
+        bool w = (conv == 'C') ? !default_wide : wide;
+        char ch = w ? win32::Narrow(std::u16string(1, char16_t(v)))[0] : char(v);
+        out += PadStr(std::string(1, ch), width, left);
+        break;
+      }
+      case 's': case 'S': {
+        gaddr p = a.Next();
+        bool w = (conv == 'S') ? !default_wide : wide;
+        std::string s;
+        if (!p) {
+          s = "(null)";
+        } else if (prec < 0) {
+          s = w ? win32::Narrow(GWStr(p)) : GStr(p);
+        } else if (w) {
+          std::u16string u;
+          for (gaddr q = p; int(u.size()) < prec && Rd16(q); q += 2) u.push_back(Rd16(q));
+          s = win32::Narrow(u);
+        } else {
+          for (gaddr q = p; int(s.size()) < prec && Rd8(q); q++) s.push_back(char(Rd8(q)));
+        }
+        if (prec >= 0 && int(s.size()) > prec) s.resize(size_t(prec));
+        out += PadStr(s, width, left);
+        break;
+      }
+      case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+        double v = a.NextD();
+        out += FormatHostOne(spec + conv, v);
+        break;
+      }
+      default:
+        a.Next();
+        break;
+    }
+  }
+  return out;
+}
+
+int WriteNarrowBuf(gaddr buf, size_t count, const std::string& s, bool truncate_mode) {
+  if (!buf || count == 0) return int(s.size());
+  size_t m = std::min(count - 1, s.size());
+  std::memcpy(g_guest_base + buf, s.data(), m);
+  Wr8(buf + m, 0);
+  if (!truncate_mode && s.size() >= count) return -1;
+  return int(m);
+}
+
+int WriteWideBuf(gaddr buf, size_t count, const std::string& s, bool truncate_mode) {
+  std::u16string w = win32::Widen(s);
+  if (!buf || count == 0) return int(w.size());
+  size_t m = std::min(count - 1, w.size());
+  std::memcpy(g_guest_base + buf, w.data(), m * 2);
+  Wr16(buf + m * 2, 0);
+  if (!truncate_mode && w.size() >= count) return -1;
+  return int(m);
+}
+
+int GuestSscanf(const std::string& input, const std::string& fmt, ArgSource& a, bool default_wide) {
+  size_t pos = 0;
+  int assigned = 0;
+  for (size_t i = 0; i < fmt.size(); i++) {
+    if (std::isspace(uint8_t(fmt[i]))) {
+      while (pos < input.size() && std::isspace(uint8_t(input[pos]))) pos++;
+      continue;
+    }
+    if (fmt[i] != '%') {
+      if (pos >= input.size() || input[pos] != fmt[i]) return assigned;
+      pos++;
+      continue;
+    }
+    i++;
+    if (i >= fmt.size()) break;
+    if (fmt[i] == '%') {
+      if (pos >= input.size() || input[pos] != '%') return assigned;
+      pos++;
+      continue;
+    }
+    bool suppress = false;
+    if (fmt[i] == '*') { suppress = true; i++; }
+    int width = -1;
+    while (i < fmt.size() && std::isdigit(uint8_t(fmt[i]))) {
+      width = (width < 0 ? 0 : width) * 10 + (fmt[i++] - '0');
+    }
+    int bits = 32;
+    bool is_long_fp = false;
+    bool wide = default_wide;
+    if (i < fmt.size() && fmt[i] == 'h') {
+      bits = (i + 1 < fmt.size() && fmt[i + 1] == 'h') ? (i++, 8) : 16;
+      wide = false;
+      i++;
+    } else if (i < fmt.size() && fmt[i] == 'l') {
+      if (i + 1 < fmt.size() && fmt[i + 1] == 'l') { bits = 64; i += 2; }
+      else { is_long_fp = true; wide = true; i++; }
+    } else if (i + 2 < fmt.size() && fmt[i] == 'I' && fmt[i + 1] == '6' && fmt[i + 2] == '4') {
+      bits = 64;
+      i += 3;
+    }
+    if (i >= fmt.size()) break;
+    char conv = fmt[i];
+    if (conv != 'c' && conv != 'n') {
+      while (pos < input.size() && std::isspace(uint8_t(input[pos]))) pos++;
+    }
+    if (pos >= input.size() && conv != 'n') return assigned == 0 ? -1 : assigned;
+
+    auto slice = [&](size_t max_chars) {
+      size_t lim = (width > 0) ? std::min(size_t(width), max_chars) : max_chars;
+      return input.substr(pos, std::min(lim, input.size() - pos));
+    };
+
+    switch (conv) {
+      case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
+        std::string sub = slice(64);
+        char* endp = nullptr;
+        int base = (conv == 'x' || conv == 'X') ? 16 : (conv == 'o') ? 8 : (conv == 'i') ? 0 : 10;
+        if (conv == 'd' || conv == 'i') {
+          long long v = std::strtoll(sub.c_str(), &endp, base);
+          if (endp == sub.c_str()) return assigned;
+          pos += size_t(endp - sub.c_str());
+          if (!suppress) {
+            gaddr dst = a.Next();
+            if (bits == 64) Wr64(dst, uint64_t(v));
+            else if (bits == 16) Wr16(dst, uint16_t(v));
+            else if (bits == 8) Wr8(dst, uint8_t(v));
+            else Wr32(dst, uint32_t(v));
+            assigned++;
+          }
+        } else {
+          unsigned long long v = std::strtoull(sub.c_str(), &endp, base);
+          if (endp == sub.c_str()) return assigned;
+          pos += size_t(endp - sub.c_str());
+          if (!suppress) {
+            gaddr dst = a.Next();
+            if (bits == 64) Wr64(dst, uint64_t(v));
+            else if (bits == 16) Wr16(dst, uint16_t(v));
+            else if (bits == 8) Wr8(dst, uint8_t(v));
+            else Wr32(dst, uint32_t(v));
+            assigned++;
+          }
+        }
+        break;
+      }
+      case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+        std::string sub = slice(64);
+        char* endp = nullptr;
+        double v = std::strtod(sub.c_str(), &endp);
+        if (endp == sub.c_str()) return assigned;
+        pos += size_t(endp - sub.c_str());
+        if (!suppress) {
+          gaddr dst = a.Next();
+          if (is_long_fp) {
+            uint64_t b = 0; std::memcpy(&b, &v, 8);
+            Wr64(dst, b);
+          } else {
+            float fv = float(v);
+            uint32_t b = 0; std::memcpy(&b, &fv, 4);
+            Wr32(dst, b);
+          }
+          assigned++;
+        }
+        break;
+      }
+      case 's': {
+        size_t start_p = pos;
+        size_t lim = (width > 0) ? size_t(width) : input.size();
+        while (pos < input.size() && (pos - start_p) < lim && !std::isspace(uint8_t(input[pos]))) pos++;
+        if (pos == start_p) return assigned;
+        std::string tok = input.substr(start_p, pos - start_p);
+        if (!suppress) {
+          gaddr dst = a.Next();
+          if (wide) {
+            std::u16string w = win32::Widen(tok);
+            std::memcpy(g_guest_base + dst, w.data(), w.size() * 2);
+            Wr16(dst + w.size() * 2, 0);
+          } else {
+            PutStr(dst, tok);
+          }
+          assigned++;
+        }
+        break;
+      }
+      case 'c': {
+        size_t cnt = (width > 0) ? size_t(width) : 1;
+        if (pos + cnt > input.size()) return assigned;
+        if (!suppress) {
+          gaddr dst = a.Next();
+          for (size_t k = 0; k < cnt; k++) {
+            if (wide) Wr16(dst + k * 2, uint16_t(uint8_t(input[pos + k])));
+            else Wr8(dst + k, uint8_t(input[pos + k]));
+          }
+          assigned++;
+        }
+        pos += cnt;
+        break;
+      }
+      case 'n': {
+        if (!suppress) {
+          gaddr dst = a.Next();
+          Wr32(dst, uint32_t(pos));
+        }
+        break;
+      }
+      default:
+        return assigned;
+    }
+  }
+  return assigned;
+}
+
+}  // namespace
+
 // Console & string formatting
 HLE64("msvcr100.dll", printf, kCdecl) {
-  std::string fmt = GStr(Arg(c, 0));
-  std::printf("%s", fmt.c_str());
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 1);
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 0)), a, false);
+  std::printf("%s", s.c_str());
+  return uint32_t(s.size());
 }
 
 HLE64("msvcr100.dll", wprintf, kCdecl) {
-  std::string fmt = win32::Narrow(GWStr(Arg(c, 0)));
-  std::printf("%s", fmt.c_str());
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 1);
+  std::string s = FormatGuestPrintf(win32::Narrow(GWStr(Arg(c, 0))), a, true);
+  std::printf("%s", s.c_str());
+  return uint32_t(s.size());
 }
 
 HLE64("msvcr100.dll", fprintf, kCdecl) {
   FILE* fp = GetFp(Arg(c, 0));
-  std::string fmt = GStr(Arg(c, 1));
-  if (fp) return std::fprintf(fp, "%s", fmt.c_str());
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 1)), a, false);
+  if (fp) return std::fprintf(fp, "%s", s.c_str());
+  return uint32_t(s.size());
 }
 
 HLE64("msvcr100.dll", _vsnprintf, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t count = Arg(c, 1);
-  const char* fmt = reinterpret_cast<const char*>(g_guest_base + Arg(c, 2));
-  int res = std::snprintf(reinterpret_cast<char*>(g_guest_base + buf), count, "%s", fmt);
-  return res;
+  ArgSource a = ArgSource::FromVa(Arg(c, 3));
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 2)), a, false);
+  return uint32_t(WriteNarrowBuf(buf, count, s, false));
 }
 
 HLE64("msvcr100.dll", _vsnprintf_s, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t size = Arg(c, 1);
   size_t count = Arg(c, 2);
-  const char* fmt = reinterpret_cast<const char*>(g_guest_base + Arg(c, 3));
-  size_t m = std::min(size, count);
-  return std::snprintf(reinterpret_cast<char*>(g_guest_base + buf), m, "%s", fmt);
+  ArgSource a = ArgSource::FromVa(Arg(c, 4));
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 3)), a, false);
+  bool trunc = (count == size_t(-1));
+  return uint32_t(WriteNarrowBuf(buf, std::min(size, count), s, trunc));
 }
 
 HLE64("msvcr100.dll", _vsnwprintf, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t count = Arg(c, 1);
-  std::u16string wfmt = GWStr(Arg(c, 2));
-  gaddr va = Arg(c, 3);
-
-  GuestArgs a{va};
-  std::u16string out;
-  for (size_t i = 0; i < wfmt.size(); i++) {
-    if (wfmt[i] != u'%') {
-      out.push_back(wfmt[i]);
-      continue;
-    }
-    i++;
-    if (i >= wfmt.size()) break;
-    if (wfmt[i] == u'%') {
-      out.push_back(u'%');
-      continue;
-    }
-    while (i < wfmt.size() && (wfmt[i] == u'-' || wfmt[i] == u'+' || wfmt[i] == u' ' || wfmt[i] == u'#' || wfmt[i] == u'0')) i++;
-    if (i < wfmt.size() && wfmt[i] == u'*') { a.Next(); i++; }
-    else while (i < wfmt.size() && (wfmt[i] >= u'0' && wfmt[i] <= u'9')) i++;
-    if (i < wfmt.size() && wfmt[i] == u'.') {
-      i++;
-      if (i < wfmt.size() && wfmt[i] == u'*') { a.Next(); i++; }
-      else while (i < wfmt.size() && (wfmt[i] >= u'0' && wfmt[i] <= u'9')) i++;
-    }
-    int bits = 32;
-    bool wide = true;
-    if (i < wfmt.size() && wfmt[i] == u'h') { bits = 16; wide = false; i++; }
-    else if (i < wfmt.size() && wfmt[i] == u'l') { bits = 64; wide = true; i++; }
-    else if (i + 2 < wfmt.size() && wfmt[i] == u'I' && wfmt[i+1] == u'6' && wfmt[i+2] == u'4') { bits = 64; i += 3; }
-
-    if (i >= wfmt.size()) break;
-    char16_t conv = wfmt[i];
-    switch (conv) {
-      case u's': case u'S': {
-        gaddr p = a.Next();
-        if (!p) {
-          out += win32::Widen("(null)");
-        } else {
-          if (wide && conv == u's') {
-            out += GWStr(p);
-          } else {
-            out += win32::Widen(GStr(p));
-          }
-        }
-        break;
-      }
-      case u'd': case u'i': {
-        int64_t v = (bits == 64) ? (int64_t)a.Next() : (int32_t)a.Next();
-        out += win32::Widen(std::to_string(v));
-        break;
-      }
-      case u'u': {
-        uint64_t v = (bits == 64) ? (uint64_t)a.Next() : (uint32_t)a.Next();
-        out += win32::Widen(std::to_string(v));
-        break;
-      }
-      case u'x': case u'X': {
-        uint64_t v = (bits == 64) ? (uint64_t)a.Next() : (uint32_t)a.Next();
-        char b[32];
-        std::snprintf(b, sizeof(b), (conv == u'X') ? "%llX" : "%llx", (unsigned long long)v);
-        out += win32::Widen(b);
-        break;
-      }
-      case u'c': {
-        uint64_t v = a.Next();
-        out.push_back((char16_t)v);
-        break;
-      }
-      default:
-        a.Next();
-        break;
-    }
-  }
-
-  size_t m = std::min(count - 1, out.size());
-  std::memcpy(g_guest_base + buf, out.c_str(), m * 2);
-  Wr16(buf + m * 2, 0);
-  return int(m);
+  ArgSource a = ArgSource::FromVa(Arg(c, 3));
+  std::string s = FormatGuestPrintf(win32::Narrow(GWStr(Arg(c, 2))), a, true);
+  return uint32_t(WriteWideBuf(buf, count, s, count == size_t(-1)));
 }
 
 HLE64("msvcr100.dll", _vsnwprintf_s, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t size = Arg(c, 1);
   size_t count = Arg(c, 2);
-  std::u16string wfmt = GWStr(Arg(c, 3));
-  gaddr va = Arg(c, 4);
-
-  GuestArgs a{va};
-  std::u16string out;
-  for (size_t i = 0; i < wfmt.size(); i++) {
-    if (wfmt[i] != u'%') {
-      out.push_back(wfmt[i]);
-      continue;
-    }
-    i++;
-    if (i >= wfmt.size()) break;
-    if (wfmt[i] == u'%') {
-      out.push_back(u'%');
-      continue;
-    }
-    while (i < wfmt.size() && (wfmt[i] == u'-' || wfmt[i] == u'+' || wfmt[i] == u' ' || wfmt[i] == u'#' || wfmt[i] == u'0')) i++;
-    if (i < wfmt.size() && wfmt[i] == u'*') { a.Next(); i++; }
-    else while (i < wfmt.size() && (wfmt[i] >= u'0' && wfmt[i] <= u'9')) i++;
-    if (i < wfmt.size() && wfmt[i] == u'.') {
-      i++;
-      if (i < wfmt.size() && wfmt[i] == u'*') { a.Next(); i++; }
-      else while (i < wfmt.size() && (wfmt[i] >= u'0' && wfmt[i] <= u'9')) i++;
-    }
-    int bits = 32;
-    bool wide = true;
-    if (i < wfmt.size() && wfmt[i] == u'h') { bits = 16; wide = false; i++; }
-    else if (i < wfmt.size() && wfmt[i] == u'l') { bits = 64; wide = true; i++; }
-    else if (i + 2 < wfmt.size() && wfmt[i] == u'I' && wfmt[i+1] == u'6' && wfmt[i+2] == u'4') { bits = 64; i += 3; }
-
-    if (i >= wfmt.size()) break;
-    char16_t conv = wfmt[i];
-    switch (conv) {
-      case u's': case u'S': {
-        gaddr p = a.Next();
-        if (!p) {
-          out += win32::Widen("(null)");
-        } else {
-          if (wide && conv == u's') {
-            out += GWStr(p);
-          } else {
-            out += win32::Widen(GStr(p));
-          }
-        }
-        break;
-      }
-      case u'd': case u'i': {
-        int64_t v = (bits == 64) ? (int64_t)a.Next() : (int32_t)a.Next();
-        out += win32::Widen(std::to_string(v));
-        break;
-      }
-      case u'u': {
-        uint64_t v = (bits == 64) ? (uint64_t)a.Next() : (uint32_t)a.Next();
-        out += win32::Widen(std::to_string(v));
-        break;
-      }
-      case u'x': case u'X': {
-        uint64_t v = (bits == 64) ? (uint64_t)a.Next() : (uint32_t)a.Next();
-        char b[32];
-        std::snprintf(b, sizeof(b), (conv == u'X') ? "%llX" : "%llx", (unsigned long long)v);
-        out += win32::Widen(b);
-        break;
-      }
-      case u'c': {
-        uint64_t v = a.Next();
-        out.push_back((char16_t)v);
-        break;
-      }
-      default:
-        a.Next();
-        break;
-    }
-  }
-
-  size_t limit = std::min(size, count);
-  if (limit == 0) return 0;
-  size_t m = std::min(limit - 1, out.size());
-  std::memcpy(g_guest_base + buf, out.c_str(), m * 2);
-  Wr16(buf + m * 2, 0);
-  return int(m);
+  ArgSource a = ArgSource::FromVa(Arg(c, 4));
+  std::string s = FormatGuestPrintf(win32::Narrow(GWStr(Arg(c, 3))), a, true);
+  bool trunc = (count == size_t(-1));
+  return uint32_t(WriteWideBuf(buf, std::min(size, count), s, trunc));
 }
 
 HLE64("msvcr100.dll", sprintf, kCdecl) {
   gaddr buf = Arg(c, 0);
-  std::string fmt = GStr(Arg(c, 1));
-  PutStr(buf, fmt);
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 1)), a, false);
+  PutStr(buf, s);
+  return uint32_t(s.size());
 }
 
 HLE64("msvcr100.dll", sprintf_s, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t size = Arg(c, 1);
-  std::string fmt = GStr(Arg(c, 2));
-  if (fmt.size() + 1 > size) return -1;
-  PutStr(buf, fmt);
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 3);
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 2)), a, false);
+  return uint32_t(WriteNarrowBuf(buf, size, s, false));
 }
 
 HLE64("msvcr100.dll", _snprintf, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t count = Arg(c, 1);
-  std::string fmt = GStr(Arg(c, 2));
-  if (count > 0) {
-    size_t copy_len = std::min(count - 1, fmt.size());
-    std::memcpy(g_guest_base + buf, fmt.c_str(), copy_len);
-    Wr8(buf + copy_len, 0);
-  }
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 3);
+  std::string s = FormatGuestPrintf(GStr(Arg(c, 2)), a, false);
+  return uint32_t(WriteNarrowBuf(buf, count, s, false));
 }
 
 HLE64("msvcr100.dll", swprintf_s, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t size = Arg(c, 1);
-  std::u16string fmt = GWStr(Arg(c, 2));
-  if (fmt.size() + 1 > size) return -1;
-  std::memcpy(g_guest_base + buf, fmt.c_str(), (fmt.size() + 1) * 2);
-  return uint32_t(fmt.size());
+  ArgSource a = ArgSource::FromCtx(c, 3);
+  std::string s = FormatGuestPrintf(win32::Narrow(GWStr(Arg(c, 2))), a, true);
+  return uint32_t(WriteWideBuf(buf, size, s, false));
 }
 
 HLE64("msvcr100.dll", vswprintf_s, kCdecl) {
   gaddr buf = Arg(c, 0);
   size_t size = Arg(c, 1);
-  std::string fmt = win32::Narrow(GWStr(Arg(c, 2)));
-  std::u16string wfmt = win32::Widen(fmt);
-  size_t m = std::min(size - 1, wfmt.size());
-  std::memcpy(g_guest_base + buf, wfmt.c_str(), m * 2);
-  Wr16(buf + m * 2, 0);
-  return int(m);
+  ArgSource a = ArgSource::FromVa(Arg(c, 3));
+  std::string s = FormatGuestPrintf(win32::Narrow(GWStr(Arg(c, 2))), a, true);
+  return uint32_t(WriteWideBuf(buf, size, s, false));
 }
 
-HLE64("msvcr100.dll", sscanf, kCdecl) { return 0; }
-HLE64("msvcr100.dll", sscanf_s, kCdecl) { return 0; }
-HLE64("msvcr100.dll", swscanf, kCdecl) { return 0; }
-HLE64("msvcr100.dll", swscanf_s, kCdecl) { return 0; }
+HLE64("msvcr100.dll", sscanf, kCdecl) {
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  return uint32_t(GuestSscanf(GStr(Arg(c, 0)), GStr(Arg(c, 1)), a, false));
+}
+HLE64("msvcr100.dll", sscanf_s, kCdecl) {
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  return uint32_t(GuestSscanf(GStr(Arg(c, 0)), GStr(Arg(c, 1)), a, false));
+}
+HLE64("msvcr100.dll", swscanf, kCdecl) {
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  return uint32_t(GuestSscanf(win32::Narrow(GWStr(Arg(c, 0))), win32::Narrow(GWStr(Arg(c, 1))), a, true));
+}
+HLE64("msvcr100.dll", swscanf_s, kCdecl) {
+  ArgSource a = ArgSource::FromCtx(c, 2);
+  return uint32_t(GuestSscanf(win32::Narrow(GWStr(Arg(c, 0))), win32::Narrow(GWStr(Arg(c, 1))), a, true));
+}
 
 // Stdio standard stream pointers (__iob_func)
 HLE64("msvcr100.dll", __iob_func, kCdecl) {

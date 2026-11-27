@@ -1517,7 +1517,7 @@ index 54deab3..d41dcca 100644
      VkExtensionProperties khrWin32KeyedMutex                = vk::makeExtension(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
      VkExtensionProperties amdBufferMarker                   = vk::makeExtension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
-index 2c5334d..865ffba 100644
+index 2c5334d..51f1582 100644
 --- a/src/dxvk/dxvk_graphics.cpp
 +++ b/src/dxvk/dxvk_graphics.cpp
 @@ -1,6 +1,7 @@
@@ -1528,7 +1528,43 @@ index 2c5334d..865ffba 100644
  
  #include "dxvk_device.h"
  #include "dxvk_graphics.h"
-@@ -588,8 +589,20 @@ namespace dxvk {
+@@ -8,6 +9,26 @@
+ 
+ namespace dxvk {
+ 
++  static VkFormat scaledVertexFallback(const DxvkDevice* device, VkFormat format) {
++    VkFormat fallback = VK_FORMAT_UNDEFINED;
++    if (format == VK_FORMAT_R16G16_SSCALED)
++      fallback = VK_FORMAT_R16G16_SINT;
++    else if (format == VK_FORMAT_R8G8B8A8_USCALED)
++      fallback = VK_FORMAT_R8G8B8A8_UINT;
++
++    if (fallback != VK_FORMAT_UNDEFINED
++     && !(device->getFormatFeatures(format).buffer & VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT)
++     && (device->getFormatFeatures(fallback).buffer & VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT)) {
++      static std::atomic<uint32_t> logged = { 0u };
++      uint32_t bit = format == VK_FORMAT_R16G16_SSCALED ? 1u : 2u;
++      if (!(logged.fetch_or(bit, std::memory_order_relaxed) & bit))
++        Logger::info(str::format("Vertex format fallback: ", uint32_t(format), " -> ", uint32_t(fallback)));
++      return fallback;
++    }
++
++    return format;
++  }
++
+   VkPrimitiveTopology determineGsInputTopology(
+           VkPrimitiveTopology            shader,
+           VkPrimitiveTopology            state) {
+@@ -133,7 +154,7 @@ namespace dxvk {
+         VkVertexInputAttributeDescription& attr = viAttributes[attrCount++];
+         attr.location = state.ilAttributes[i].location();
+         attr.binding = viBindingMap[state.ilAttributes[i].binding()];
+-        attr.format = state.ilAttributes[i].format();
++        attr.format = scaledVertexFallback(device, state.ilAttributes[i].format());
+         attr.offset = state.ilAttributes[i].offset();
+       }
+     }
+@@ -588,8 +609,20 @@ namespace dxvk {
  
      // Set up depth clip state. Require depth clip support,
      // this is *not* equivalent to disabling depth clamp.
@@ -1551,7 +1587,7 @@ index 2c5334d..865ffba 100644
  
      // Set up conservative rasterization if requested by the application.
      if (state.rs.conservativeMode() != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) {
-@@ -626,7 +639,11 @@ namespace dxvk {
+@@ -626,7 +659,11 @@ namespace dxvk {
      bool eq = tsInfo.patchControlPoints == other.tsInfo.patchControlPoints;
  
      if (eq) {
@@ -1564,7 +1600,7 @@ index 2c5334d..865ffba 100644
          && rsInfo.rasterizerDiscardEnable  == other.rsInfo.rasterizerDiscardEnable
          && rsInfo.polygonMode              == other.rsInfo.polygonMode
          && rsInfo.depthBiasEnable          == other.rsInfo.depthBiasEnable
-@@ -655,6 +672,10 @@ namespace dxvk {
+@@ -655,6 +692,10 @@ namespace dxvk {
      DxvkHashState hash;
      hash.add(tsInfo.patchControlPoints);
  
@@ -1575,7 +1611,7 @@ index 2c5334d..865ffba 100644
      hash.add(rsInfo.depthClampEnable);
      hash.add(rsInfo.rasterizerDiscardEnable);
      hash.add(rsInfo.polygonMode);
-@@ -698,7 +719,26 @@ namespace dxvk {
+@@ -698,7 +739,26 @@ namespace dxvk {
    DxvkGraphicsPipelineFragmentShaderState::DxvkGraphicsPipelineFragmentShaderState(
      const DxvkDevice*                     device,
      const DxvkGraphicsPipelineStateInfo&  state) {
@@ -1602,7 +1638,7 @@ index 2c5334d..865ffba 100644
    }
  
  
-@@ -770,6 +810,33 @@ namespace dxvk {
+@@ -770,6 +830,33 @@ namespace dxvk {
      const DxvkDevice*                     device,
      const DxvkGraphicsPipelineStateInfo&  state,
            DxvkGraphicsPipelineFlags       flags) {
@@ -1636,7 +1672,54 @@ index 2c5334d..865ffba 100644
      if (state.useDynamicVertexStrides())
        dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
  
-@@ -1486,18 +1553,33 @@ namespace dxvk {
+@@ -841,13 +928,14 @@ namespace dxvk {
+ 
+ 
+   DxvkGraphicsPipelineShaderState::DxvkGraphicsPipelineShaderState(
++    const DxvkDevice*                     device,
+     const DxvkGraphicsPipelineShaders&    shaders,
+     const DxvkGraphicsPipelineStateInfo&  state)
+-  : vsInfo  (getLinkage(shaders, shaders.vs, state)),
+-    tcsInfo (getLinkage(shaders, shaders.tcs, state)),
+-    tesInfo (getLinkage(shaders, shaders.tes, state)),
+-    gsInfo  (getLinkage(shaders, shaders.gs, state)),
+-    fsInfo  (getLinkage(shaders, shaders.fs, state)) {
++  : vsInfo  (getLinkage(device, shaders, shaders.vs, state)),
++    tcsInfo (getLinkage(device, shaders, shaders.tcs, state)),
++    tesInfo (getLinkage(device, shaders, shaders.tes, state)),
++    gsInfo  (getLinkage(device, shaders, shaders.gs, state)),
++    fsInfo  (getLinkage(device, shaders, shaders.fs, state)) {
+ 
+   }
+ 
+@@ -873,6 +961,7 @@ namespace dxvk {
+ 
+ 
+   DxvkShaderLinkage DxvkGraphicsPipelineShaderState::getLinkage(
++    const DxvkDevice*                     device,
+     const DxvkGraphicsPipelineShaders&    shaders,
+     const Rc<DxvkShader>&                 shader,
+     const DxvkGraphicsPipelineStateInfo&  state) {
+@@ -901,8 +990,17 @@ namespace dxvk {
+     if (shaderMeta.stage == VK_SHADER_STAGE_VERTEX_BIT) {
+       uint32_t attributeMask = 0u;
+ 
+-      for (uint32_t i = 0; i < state.il.attributeCount(); i++)
++      for (uint32_t i = 0; i < state.il.attributeCount(); i++) {
+         attributeMask |= 1u << state.ilAttributes[i].location();
++        auto format = state.ilAttributes[i].format();
++        auto fallback = scaledVertexFallback(device, format);
++        if (fallback != format) {
++          if (fallback == VK_FORMAT_R16G16_SINT)
++            info.scaledSignedInputs |= 1u << state.ilAttributes[i].location();
++          else if (fallback == VK_FORMAT_R8G8B8A8_UINT)
++            info.scaledUnsignedInputs |= 1u << state.ilAttributes[i].location();
++        }
++      }
+ 
+       info.prevStageOutputs = DxvkShaderIo::forVertexBindings(attributeMask);
+     } else {
+@@ -1486,18 +1584,33 @@ namespace dxvk {
        info.pTessellationState     = &key.prState.tsInfo;
  
      if (!m_flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)) {
@@ -1835,9 +1918,18 @@ index fc18044..dbf39fa 100644
      VkBufferDeviceAddressInfo bdaInfo = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
      bdaInfo.buffer = buffer;
 diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
-index f93ae8d..414956b 100644
+index f93ae8d..8b999f3 100644
 --- a/src/dxvk/dxvk_presenter.cpp
 +++ b/src/dxvk/dxvk_presenter.cpp
+@@ -36,7 +36,7 @@ namespace dxvk {
+     if (!desc.deferSurfaceCreation) {
+       VkResult vr = createSurface();
+ 
+-      if (vr != VK_SUCCESS && vr != VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
++      if (vr != VK_SUCCESS && vr != VK_NOT_READY && vr != VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
+         throw DxvkError(str::format("Failed to create Vulkan surface, ", vr));
+     }
+ 
 @@ -106,6 +106,10 @@ namespace dxvk {
        m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
          m_swapchain, std::numeric_limits<uint64_t>::max(),
@@ -1882,7 +1974,26 @@ index f93ae8d..414956b 100644
      if (status != VK_SUCCESS) {
        Logger::info(str::format("Presenter: Got ", status, ", recreating swapchain"));
  
-@@ -1102,6 +1119,13 @@ namespace dxvk {
+@@ -560,7 +577,18 @@ namespace dxvk {
+   }
+ 
+ 
++#ifdef DXVK_WSI_ANDROID
++  extern "C" uint64_t dxvk_android_window_generation();
++#endif
++
+   void Presenter::updateSwapChain() {
++#ifdef DXVK_WSI_ANDROID
++    uint64_t generation = dxvk_android_window_generation();
++    if (m_androidWindowGeneration != generation) {
++      m_androidWindowGeneration = generation;
++      m_dirtySurface = true;
++    }
++#endif
+     if (m_dirtySurface || m_dirtySwapchain) {
+       destroySwapchain();
+       m_dirtySwapchain = false;
+@@ -1102,6 +1130,13 @@ namespace dxvk {
        }
      }
  
@@ -1896,11 +2007,52 @@ index f93ae8d..414956b 100644
      // Otherwise, find a supported format for the color space
      const PresenterFormatList* compatList = nullptr;
  
+@@ -1198,7 +1233,7 @@ namespace dxvk {
+   VkResult Presenter::createSurface() {
+     VkResult vr = m_surfaceProc(&m_surface);
+ 
+-    if (vr != VK_SUCCESS)
++    if (vr != VK_SUCCESS && vr != VK_NOT_READY)
+       Logger::err(str::format("Presenter: Failed to create Vulkan surface: ", vr));
+ 
+     return vr;
+diff --git a/src/dxvk/dxvk_presenter.h b/src/dxvk/dxvk_presenter.h
+index f4b8a0c..1efab8c 100644
+--- a/src/dxvk/dxvk_presenter.h
++++ b/src/dxvk/dxvk_presenter.h
+@@ -292,6 +292,9 @@ namespace dxvk {
+ 
+     bool                        m_dirtySwapchain = false;
+     bool                        m_dirtySurface = false;
++#ifdef DXVK_WSI_ANDROID
++    uint64_t                    m_androidWindowGeneration = 0;
++#endif
+ 
+     bool                        m_hasPresentId = false;
+     bool                        m_hasPresentWait = false;
 diff --git a/src/dxvk/dxvk_shader.cpp b/src/dxvk/dxvk_shader.cpp
-index 8f6261b..ccd8d52 100644
+index 8f6261b..e88909f 100644
 --- a/src/dxvk/dxvk_shader.cpp
 +++ b/src/dxvk/dxvk_shader.cpp
-@@ -105,6 +105,18 @@ namespace dxvk {
+@@ -16,6 +16,8 @@ namespace dxvk {
+ 
+   bool DxvkShaderLinkage::eq(const DxvkShaderLinkage& other) const {
+     bool eq = fsDualSrcBlend  == other.fsDualSrcBlend
++           && scaledSignedInputs == other.scaledSignedInputs
++           && scaledUnsignedInputs == other.scaledUnsignedInputs
+            && fsFlatShading   == other.fsFlatShading
+            && sampleLocations == other.sampleLocations
+            && semanticIo      == other.semanticIo;
+@@ -41,6 +43,8 @@ namespace dxvk {
+   size_t DxvkShaderLinkage::hash() const {
+     DxvkHashState hash;
+     hash.add(uint32_t(fsDualSrcBlend));
++    hash.add(scaledSignedInputs);
++    hash.add(scaledUnsignedInputs);
+     hash.add(uint32_t(fsFlatShading));
+     hash.add(uint32_t(sampleLocations));
+     hash.add(uint32_t(semanticIo));
+@@ -105,6 +109,18 @@ namespace dxvk {
      stageInfo.pName = "main";
      stageInfo.pSpecializationInfo = specInfo;
  
@@ -1919,7 +2071,7 @@ index 8f6261b..ccd8d52 100644
      m_stageCount++;
    }
    
-@@ -135,7 +147,10 @@ namespace dxvk {
+@@ -135,7 +151,10 @@ namespace dxvk {
  
  
    DxvkShaderStageInfo::~DxvkShaderStageInfo() {
@@ -2213,3 +2365,280 @@ index f1fae3f..97433d7 100644
  
    void init();
    void quit();
+diff --git a/src/wsi/android/wsi_platform_android.cpp b/src/wsi/android/wsi_platform_android.cpp
+new file mode 100644
+index 0000000..4045e01
+--- /dev/null
++++ b/src/wsi/android/wsi_platform_android.cpp
+@@ -0,0 +1,159 @@
++#if defined(DXVK_WSI_ANDROID)
++
++// Android WSI for DXVK Native (RunnerRecompiled). One display: the app's view. Windows are opaque
++// handles of the host program; every one of them presents to the ANativeWindow it hands over with
++// dxvk_android_set_window(). Modes: the view's size at 60 Hz.
++
++#include "../wsi_platform.h"
++#include "../wsi_window.h"
++#include "../../util/util_error.h"
++#include "../../util/util_string.h"
++#include "../../util/log/log.h"
++
++#include <android/native_window.h>
++#include <vulkan/vulkan_android.h>
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++
++static std::atomic<ANativeWindow*> g_androidWindow { nullptr };
++static std::atomic<uint64_t> g_androidWindowGeneration { 0 };
++static std::mutex g_androidWindowMutex;
++static std::condition_variable g_androidWindowChanged;
++
++extern "C" __attribute__((visibility("default"))) void dxvk_android_set_window(ANativeWindow* window) {
++  std::lock_guard lock(g_androidWindowMutex);
++  ANativeWindow* old = g_androidWindow.load();
++  if (old == window) return;
++  if (window) ANativeWindow_acquire(window);
++  g_androidWindow.store(window);
++  g_androidWindowGeneration.fetch_add(1);
++  if (old) ANativeWindow_release(old);
++  g_androidWindowChanged.notify_all();
++}
++
++extern "C" uint64_t dxvk_android_window_generation() {
++  return g_androidWindowGeneration.load();
++}
++
++namespace dxvk::wsi {
++
++  static const HMONITOR AndroidMonitor = reinterpret_cast<HMONITOR>(uintptr_t(1));
++
++  static void viewSize(uint32_t* w, uint32_t* h) {
++    std::lock_guard lock(g_androidWindowMutex);
++    ANativeWindow* window = g_androidWindow.load();
++    int32_t ww = window ? ANativeWindow_getWidth(window) : 0;
++    int32_t hh = window ? ANativeWindow_getHeight(window) : 0;
++    *w = uint32_t(ww > 0 ? ww : 1280);
++    *h = uint32_t(hh > 0 ? hh : 720);
++  }
++
++  class AndroidWsiDriver : public WsiDriver {
++  public:
++    std::vector<const char *> getInstanceExtensions() {
++      return { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
++    }
++
++    HMONITOR getDefaultMonitor() { return AndroidMonitor; }
++
++    HMONITOR enumMonitors(uint32_t index) { return index == 0 ? AndroidMonitor : nullptr; }
++
++    HMONITOR enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index) { return enumMonitors(index); }
++
++    bool getDisplayName(HMONITOR hMonitor, WCHAR (&Name)[32]) {
++      const WCHAR name[] = { '\\', '\\', '.', '\\', 'D', 'I', 'S', 'P', 'L', 'A', 'Y', '1', 0 };
++      for (uint32_t i = 0; i < sizeof(name) / sizeof(name[0]); i++)
++        Name[i] = name[i];
++      return hMonitor == AndroidMonitor;
++    }
++
++    bool getDesktopCoordinates(HMONITOR hMonitor, RECT* pRect) {
++      uint32_t w, h;
++      viewSize(&w, &h);
++      pRect->left = 0; pRect->top = 0; pRect->right = LONG(w); pRect->bottom = LONG(h);
++      return hMonitor == AndroidMonitor;
++    }
++
++    // The surface size and smaller sizes of the same shape: the game renders in the mode it
++    // chooses (ResX/ResY in its ini) and the swap chain scales the picture to the surface.
++    bool getDisplayMode(HMONITOR hMonitor, uint32_t modeNumber, WsiMode* pMode) {
++      static const uint32_t scale[][2] = { { 3, 8 }, { 1, 2 }, { 2, 3 }, { 3, 4 }, { 1, 1 } };
++      if (modeNumber >= sizeof(scale) / sizeof(scale[0]))
++        return false;
++      if (!getCurrentDisplayMode(hMonitor, pMode))
++        return false;
++      pMode->width = pMode->width * scale[modeNumber][0] / scale[modeNumber][1] & ~7u; // the engine aligns its buffers to 8
++      pMode->height = pMode->height * scale[modeNumber][0] / scale[modeNumber][1] & ~7u; // the engine aligns its buffers to 8
++      return true;
++    }
++
++    bool getCurrentDisplayMode(HMONITOR hMonitor, WsiMode* pMode) {
++      viewSize(&pMode->width, &pMode->height);
++      pMode->refreshRate = WsiRational { 60, 1 };
++      pMode->bitsPerPixel = 32;
++      pMode->interlaced = false;
++      return hMonitor == AndroidMonitor;
++    }
++
++    bool getDesktopDisplayMode(HMONITOR hMonitor, WsiMode* pMode) { return getCurrentDisplayMode(hMonitor, pMode); }
++
++    WsiEdidData getMonitorEdid(HMONITOR hMonitor) { return {}; }
++
++    void getWindowSize(HWND hWindow, uint32_t* pWidth, uint32_t* pHeight) {
++      uint32_t w, h;
++      viewSize(&w, &h);
++      if (pWidth) *pWidth = w;
++      if (pHeight) *pHeight = h;
++    }
++
++    // The view has the size the app gives it: the swap chain scales.
++    void resizeWindow(HWND hWindow, DxvkWindowState* pState, uint32_t width, uint32_t height) { }
++    void saveWindowState(HWND hWindow, DxvkWindowState* pState, bool saveStyle) { }
++    void restoreWindowState(HWND hWindow, DxvkWindowState* pState, bool restoreCoordinates) { }
++    bool setWindowMode(HMONITOR hMonitor, HWND hWindow, DxvkWindowState* pState, const WsiMode& mode) { return true; }
++    bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow, DxvkWindowState* pState, bool modeSwitch) { return true; }
++    bool leaveFullscreenMode(HWND hWindow, DxvkWindowState* pState) { return true; }
++    bool restoreDisplayMode() { return true; }
++    HMONITOR getWindowMonitor(HWND hWindow) { return AndroidMonitor; }
++    bool isWindow(HWND hWindow) { return hWindow != nullptr; }
++    bool isMinimized(HWND hWindow) { return g_androidWindow.load() == nullptr; }
++    bool isOccluded(HWND hWindow) { return g_androidWindow.load() == nullptr; }
++    void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, bool forceTopmost) { }
++
++    VkResult createSurface(HWND hWindow, PFN_vkGetInstanceProcAddr pfnVkGetInstanceProcAddr,
++                           VkInstance instance, VkSurfaceKHR* pSurface) {
++      std::unique_lock lock(g_androidWindowMutex);
++      ANativeWindow* window = g_androidWindow.load();
++      if (!window) {
++        g_androidWindowChanged.wait_for(lock, std::chrono::milliseconds(250), [] {
++          return g_androidWindow.load() != nullptr;
++        });
++        window = g_androidWindow.load();
++        if (!window) return VK_NOT_READY;
++      }
++      auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
++        pfnVkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR"));
++      if (!create)
++        return VK_ERROR_EXTENSION_NOT_PRESENT;
++      VkAndroidSurfaceCreateInfoKHR info = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++      info.window = window;
++      return create(instance, &info, nullptr, pSurface);
++    }
++  };
++
++  static bool createAndroidWsiDriver(WsiDriver **driver) {
++    *driver = new AndroidWsiDriver();
++    return true;
++  }
++
++  WsiBootstrap AndroidWSI = {
++    "Android",
++    createAndroidWsiDriver
++  };
++
++}
++
++#endif
+diff --git a/src/dxvk/dxvk_graphics.h b/src/dxvk/dxvk_graphics.h
+index 98eea48..23810e1 100644
+--- a/src/dxvk/dxvk_graphics.h
++++ b/src/dxvk/dxvk_graphics.h
+@@ -240,6 +240,7 @@ namespace dxvk {
+     DxvkGraphicsPipelineShaderState();
+ 
+     DxvkGraphicsPipelineShaderState(
++      const DxvkDevice*                     device,
+       const DxvkGraphicsPipelineShaders&    shaders,
+       const DxvkGraphicsPipelineStateInfo&  state);
+ 
+@@ -256,6 +257,7 @@ namespace dxvk {
+   private:
+ 
+     DxvkShaderLinkage getLinkage(
++      const DxvkDevice*                     device,
+       const DxvkGraphicsPipelineShaders&    shaders,
+       const Rc<DxvkShader>&                 shader,
+       const DxvkGraphicsPipelineStateInfo&  state);
+@@ -432,7 +434,7 @@ namespace dxvk {
+       const DxvkGraphicsPipelineStateInfo&    state,
+             DxvkGraphicsPipelineFlags         flags,
+             uint32_t                          specConstantMask)
+-    : shState(shaders, state),
++    : shState(device, shaders, state),
+       dyState(device, state, flags),
+       viState(device, state, shaders),
+       prState(device, state, shaders),
+diff --git a/src/dxvk/dxvk_shader.h b/src/dxvk/dxvk_shader.h
+index d7619c7..7a49c05 100644
+--- a/src/dxvk/dxvk_shader.h
++++ b/src/dxvk/dxvk_shader.h
+@@ -201,6 +201,8 @@ namespace dxvk {
+    * \brief Shader module create info
+    */
+   struct DxvkShaderLinkage {
++    uint32_t scaledSignedInputs = 0;
++    uint32_t scaledUnsignedInputs = 0;
+     bool fsDualSrcBlend  = false;
+     bool fsFlatShading   = false;
+     bool sampleLocations = false;
+diff --git a/src/dxvk/dxvk_shader_ir.cpp b/src/dxvk/dxvk_shader_ir.cpp
+index 4789cd0..0ccc186 100644
+--- a/src/dxvk/dxvk_shader_ir.cpp
++++ b/src/dxvk/dxvk_shader_ir.cpp
+@@ -2083,6 +2083,45 @@ namespace dxvk {
+         ioPass.enableSampleInterpolation();
+     }
+ 
++    // Unsupported scaled vertex formats are bound as integer formats. Convert
++    // the input numerically, preserving the D3D shader's floating-point values.
++    if (linkage && m_metadata.stage == VK_SHADER_STAGE_VERTEX_BIT &&
++        (linkage->scaledSignedInputs || linkage->scaledUnsignedInputs)) {
++      using namespace dxbc_spv;
++      auto [first, last] = irBuilder.getDeclarations();
++      for (auto iter = first; iter != last; ++iter) {
++        if (iter->getOpCode() != ir::OpCode::eDclInput)
++          continue;
++        uint32_t location = uint32_t(iter->getOperand(iter->getFirstLiteralOperandIndex()));
++        uint32_t mask = 1u << location;
++        bool isSigned = (linkage->scaledSignedInputs & mask) != 0;
++        if (!isSigned && !(linkage->scaledUnsignedInputs & mask))
++          continue;
++
++        auto oldType = iter->getType();
++        auto base = oldType.getBaseType(0u);
++        auto scalar = isSigned ? ir::ScalarType::eI32 : ir::ScalarType::eU32;
++        ir::Type inputType(scalar, base.getVectorSize());
++        for (uint32_t i = 0; i < oldType.getArrayDimensions(); ++i)
++          inputType.addArrayDimension(oldType.getArraySize(i));
++
++        util::small_vector<ir::SsaDef, 16u> uses;
++        irBuilder.getUses(iter->getDef(), uses);
++        irBuilder.setOpType(iter->getDef(), inputType);
++        for (auto use : uses) {
++          const auto& op = irBuilder.getOp(use);
++          if (op.getOpCode() != ir::OpCode::eInputLoad)
++            continue;
++          auto resultType = op.getType();
++          auto resultBase = resultType.getBaseType(0u);
++          auto integerType = ir::Type(scalar, resultBase.getVectorSize());
++          auto input = irBuilder.addBefore(use, ir::Op::InputLoad(integerType,
++            ir::SsaDef(op.getOperand(0u)), ir::SsaDef(op.getOperand(1u))));
++          irBuilder.rewriteOp(use, ir::Op::ConvertItoF(resultType, input));
++        }
++      }
++    }
++
+     // Set up SPIR-V options. Only enable float controls if a sufficient subset
+     // of features is supported; this avoids running into performance issues on
+     // Nvidia where just enabling RTE on FP32 causes a ~20% performance drop.
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index 96dfa5d..5bfc639 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -144,9 +144,12 @@ namespace dxvk {
+     vk->vkGetPhysicalDeviceFormatProperties2(m_handle, format, &properties2);
+ 
+     DxvkFormatFeatures result;
+-    result.optimal = properties3.optimalTilingFeatures;
+-    result.linear  = properties3.linearTilingFeatures;
+-    result.buffer  = properties3.bufferFeatures;
++    // Vulkan 1.1 devices may ignore VkFormatProperties3 when
++    // VK_KHR_format_feature_flags2 is unavailable. Its low 32 bits match the
++    // core VkFormatProperties returned in properties2.
++    result.optimal = properties3.optimalTilingFeatures | properties2.formatProperties.optimalTilingFeatures;
++    result.linear  = properties3.linearTilingFeatures  | properties2.formatProperties.linearTilingFeatures;
++    result.buffer  = properties3.bufferFeatures        | properties2.formatProperties.bufferFeatures;
+     return result;
+   }
+ 

@@ -27,30 +27,31 @@
 namespace recomp::native {
 
 void FNameErrorDump(::recomp::Ctx& c, ::recomp::GuestFn original) {
-  // rdi (argument 2) is the name source; r8d (argument 4) its length.
-  if (c.rdi && c.rdi < (1ULL << 36) && ::recomp::IsGuestCommitted(c.rdi)) {
+  // The Windows x64 ABI passes argument 2 in RDX; the lifted body moves it
+  // into RDI only after this wrapper has run.
+  if (c.rdx && c.rdx < (1ULL << 36) && ::recomp::IsGuestCommitted(c.rdx)) {
     char name[160];
-    const uint16_t* w = reinterpret_cast<const uint16_t*>(g_guest_base + c.rdi);
+    const uint16_t* w = reinterpret_cast<const uint16_t*>(g_guest_base + c.rdx);
     int n = 0;
-    for (; n < 80 && w[n]; ++n) {
+    for (; n < 79 && ::recomp::IsGuestCommitted(c.rdx + 2 * n + 1) && w[n]; ++n) {
       uint16_t ch = w[n];
       name[n] = (ch >= 0x20 && ch < 0x7F) ? char(ch) : '?';
     }
     name[n] = 0;
-    RECOMP_TRACE("FNameErrorDump: name src=0x%llX len=%u text=\"%s\"\n",
-                 (unsigned long long)c.rdi, (unsigned)uint32_t(c.r8), name);
+    ::recomp::WarnF("UE3 error: src=0x%llX code=%u text=\"%s\"",
+                    (unsigned long long)c.rdx, (unsigned)uint32_t(c.r8), name);
 #if defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
                         "FNameErrorDump: name src=0x%llX len=%u text=\"%s\"",
-                        (unsigned long long)c.rdi, (unsigned)uint32_t(c.r8), name);
+                        (unsigned long long)c.rdx, (unsigned)uint32_t(c.r8), name);
 #endif
   } else {
     RECOMP_TRACE("FNameErrorDump: name src=0x%llX (not mapped)\n",
-                 (unsigned long long)c.rdi);
+                 (unsigned long long)c.rdx);
 #if defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_ERROR, "OutlastNative",
                         "FNameErrorDump: name src=0x%llX (not mapped)",
-                        (unsigned long long)c.rdi);
+                        (unsigned long long)c.rdx);
 #endif
   }
   // Run the reporter itself, unchanged.

@@ -3,7 +3,10 @@
 #include "win32/hle.h"
 #include "win32/com.h"
 #include "win32/kernel32_state.h"
+#include "win32/android_input.h"
 #include "log.h"
+
+#include <atomic>
 
 namespace recomp::win32 {
 
@@ -131,8 +134,33 @@ HLE64_NAMED("d3dx9_43.dll", "D3DXDisassembleShader", d3dx9_43_dll_D3DXDisassembl
     return 0;
 }
 
-HLE64_NAMED("d3dx9_43.dll", "D3DXMatrixInverse", d3dx9_43_dll_D3DXMatrixInverse, 0) {
-    return 0;
+HLE64_NAMED("d3dx9_43.dll", "D3DXMatrixInverse", d3dx9_43_dll_D3DXMatrixInverse, 3) {
+  const gaddr out = Arg(c, 0), det_out = Arg(c, 1), in = Arg(c, 2);
+  if (!out || !in) return 0;
+  float m[4][4], adjugate[4][4];
+  std::memcpy(m, GPtr(in), sizeof(m));  // D3DX permits in-place inversion.
+
+  // Each cofactor uses the three rows and columns left after removing one.
+  static constexpr int remaining[4][3] = {{1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+  for (int row = 0; row < 4; ++row) {
+    const auto& [a, b, d] = remaining[row];
+    for (int col = 0; col < 4; ++col) {
+      const auto& [x, y, z] = remaining[col];
+      const float minor = m[a][x] * (m[b][y] * m[d][z] - m[b][z] * m[d][y])
+                        - m[a][y] * (m[b][x] * m[d][z] - m[b][z] * m[d][x])
+                        + m[a][z] * (m[b][x] * m[d][y] - m[b][y] * m[d][x]);
+      adjugate[col][row] = ((row + col) & 1) ? -minor : minor;
+    }
+  }
+  float determinant = 0;
+  for (int i = 0; i < 4; ++i) determinant += m[0][i] * adjugate[i][0];
+  if (determinant == 0) return 0;
+
+  for (auto& row : adjugate)
+    for (float& value : row) value /= determinant;
+  if (det_out) std::memcpy(GPtr(det_out), &determinant, sizeof(determinant));
+  std::memcpy(GPtr(out), adjugate, sizeof(adjugate));
+  return out;
 }
 
 HLE64_NAMED("d3dx9_43.dll", "D3DXDebugMute", d3dx9_43_dll_D3DXDebugMute, 0) {
@@ -203,6 +231,7 @@ struct DirectInputDevice8Object : public com::Object {
   bool acquired = false;
   uint32_t buffer_size = 0;
   uint32_t axis_mode = 0;
+  uint32_t input_sequence = 0;
 };
 
 gaddr DirectInput8Vtable() {
@@ -262,6 +291,8 @@ HLE64_NAMED("dinput8.dll", "IDirectInput8W::CreateDevice", di8_CreateDevice, 4) 
   auto dev = std::make_shared<DirectInputDevice8Object>();
   dev->is_mouse = (d1 == 0x6F1D2B60u);
   dev->is_keyboard = (d1 == 0x6F1D2B61u);
+  WarnF("[input] DirectInput CreateDevice guid=%08x keyboard=%d mouse=%d", d1,
+        dev->is_keyboard, dev->is_mouse);
   if (!dev->is_mouse && !dev->is_keyboard) {
     WrPtr(ppDev, 0);
     return 0x80040154u;  // DIERR_DEVICENOTREG
@@ -310,7 +341,14 @@ HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::SetProperty", did8_SetProperty
   return 0;
 }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::Acquire", did8_Acquire, 1) {
-  if (auto* dev = com::As<DirectInputDevice8Object>(Arg(c, 0))) dev->acquired = true;
+  if (auto* dev = com::As<DirectInputDevice8Object>(Arg(c, 0))) {
+    WarnF("[input] DirectInput Acquire keyboard=%d", dev->is_keyboard);
+    if (!dev->acquired) {
+      std::lock_guard<std::mutex> lock(android_input::keyboard.mutex);
+      dev->input_sequence = android_input::keyboard.sequence;
+    }
+    dev->acquired = true;
+  }
   return 0;
 }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::Unacquire", did8_Unacquire, 1) {
@@ -319,14 +357,49 @@ HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::Unacquire", did8_Unacquire, 1)
 }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::Poll", did8_Poll, 1) { return 0; }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::GetDeviceState", did8_GetDeviceState, 3) {
+  auto* dev = com::As<DirectInputDevice8Object>(Arg(c, 0));
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true)) WarnF("[input] first DirectInput GetDeviceState keyboard=%d", dev && dev->is_keyboard);
   uint32_t cb = uint32_t(Arg(c, 1));
   gaddr buf = Arg(c, 2);
-  if (buf && cb) std::memset(GPtr(buf), 0, cb);
+  if (!dev || !buf) return 0x80070057u;
+  if (!dev->acquired) return 0x8007000cu; // DIERR_NOTACQUIRED
+  if (dev->is_keyboard && cb != 256) return 0x80070057u;
+  std::memset(GPtr(buf), 0, cb);
+  if (dev->is_keyboard) {
+    std::lock_guard<std::mutex> lock(android_input::keyboard.mutex);
+    std::memcpy(GPtr(buf), android_input::keyboard.keys.data(), 256);
+    if (android_input::keyboard.keys[0x1c]) WarnF("[input] DirectInput GetDeviceState: Enter down");
+  }
   return 0;
 }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::GetDeviceData", did8_GetDeviceData, 5) {
+  auto* dev = com::As<DirectInputDevice8Object>(Arg(c, 0));
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true)) WarnF("[input] first DirectInput GetDeviceData keyboard=%d", dev && dev->is_keyboard);
+  uint32_t size = uint32_t(Arg(c, 1));
+  gaddr data = Arg(c, 2);
   gaddr pdwInOut = Arg(c, 3);
-  if (pdwInOut) Wr32(pdwInOut, 0);
+  uint32_t flags = uint32_t(Arg(c, 4));
+  if (!dev || !pdwInOut || (size != 16 && size != 24)) return 0x80070057u;
+  if (!dev->acquired) return 0x8007000cu;
+  uint32_t count = Rd32(pdwInOut), written = 0;
+  std::lock_guard<std::mutex> lock(android_input::keyboard.mutex);
+  if (dev->is_keyboard && dev->buffer_size) {
+    for (const auto& event : android_input::keyboard.events) {
+      if (event.sequence <= dev->input_sequence || written >= count) continue;
+      if (data) {
+        gaddr out = data + uint64_t(written) * size;
+        Wr32(out, event.scan); Wr32(out + 4, event.value);
+        Wr32(out + 8, event.time); Wr32(out + 12, event.sequence);
+        if (size == 24) Wr64(out + 16, 0);
+      }
+      ++written;
+      if (!(flags & 1)) dev->input_sequence = event.sequence; // DIGDD_PEEK
+    }
+  }
+  Wr32(pdwInOut, written);
+  if (written) WarnF("[input] DirectInput GetDeviceData: %u events", written);
   return 0;
 }
 HLE64_NAMED("dinput8.dll", "IDirectInputDevice8W::GetObjectInfo", did8_GetObjectInfo, 4) { return 0x80070057u; }
