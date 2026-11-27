@@ -14,7 +14,9 @@
 #include <dlfcn.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
+#include <cstring>
 #include <fcntl.h>
 #include <string>
 #include <cstdio>
@@ -608,6 +610,20 @@ void Dispatch(Ctx& c, uint64_t target, uint64_t va) {
     uint8_t* const B = ::recomp::g_guest_base;
     c.rbp = *reinterpret_cast<const uint64_t*>(B + c.rsp + 0x40u);
     gen::f_1400FACFC(c);
+    return;
+  }
+  if (target == 0x181439000ULL || target == 0x181439830ULL ||
+      target == 0x181439BB0ULL || target == 0x181439EB0ULL) {
+    float x = 0.0f, y = 0.0f, r = 0.0f;
+    std::memcpy(&x, c.xmm[0].b, sizeof(float));
+    std::memcpy(&y, c.xmm[1].b, sizeof(float));
+    if (target == 0x181439000ULL) r = std::pow(x, y);
+    else if (target == 0x181439830ULL) r = std::sin(x);
+    else if (target == 0x181439BB0ULL) r = std::cos(x);
+    else r = std::log(x);
+    std::memset(c.xmm[0].b, 0, sizeof(c.xmm[0].b));
+    std::memcpy(c.xmm[0].b, &r, sizeof(float));
+    c.rsp += 8u;
     return;
   }
   const CodeRange* r = &g_exe;
