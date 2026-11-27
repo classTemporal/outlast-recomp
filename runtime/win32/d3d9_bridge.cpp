@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <bit>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -36,13 +37,18 @@ static void (*g_dxvk_D3DPERF_SetOptions)(uint32_t) = nullptr;
 #if defined(ANDROID) || defined(__ANDROID__)
 static void (*g_dxvk_android_set_window)(ANativeWindow*) = nullptr;
 static ANativeWindow* g_active_window = nullptr;
+static std::mutex g_android_window_mutex;
 
 void SetAndroidNativeWindow(ANativeWindow* win) {
+    std::lock_guard<std::mutex> lock(g_android_window_mutex);
+    if (win) ANativeWindow_acquire(win);
+    ANativeWindow* old = g_active_window;
     g_active_window = win;
-    if (g_dxvk_android_set_window && g_active_window) {
+    if (g_dxvk_android_set_window) {
         g_dxvk_android_set_window(g_active_window);
-        TraceF("d3d9: Updated ANativeWindow to DXVK Android WSI");
+        WarnF("d3d9: Android surface updated: %p", static_cast<void*>(win));
     }
+    if (old) ANativeWindow_release(old);
 }
 #endif
 
@@ -58,6 +64,7 @@ static bool LoadDxvkD3D9() {
     }
 
 #if defined(ANDROID) || defined(__ANDROID__)
+    std::lock_guard<std::mutex> window_lock(g_android_window_mutex);
     g_dxvk_android_set_window = (void (*)(ANativeWindow*))dlsym(g_dxvk_lib, "dxvk_android_set_window");
     if (g_dxvk_android_set_window && g_active_window) {
         g_dxvk_android_set_window(g_active_window);
@@ -448,6 +455,7 @@ HLE64_NAMED("d3d9.dll", "IDirect3D9::EnumAdapterModes", d3d9_EnumAdapterModes, 5
             mode->Width = kRes[idx][0];
             mode->Height = kRes[idx][1];
 #if defined(ANDROID) || defined(__ANDROID__)
+            std::lock_guard<std::mutex> window_lock(g_android_window_mutex);
             if (idx == 0 && g_active_window) {
                 int32_t w = ANativeWindow_getWidth(g_active_window);
                 int32_t h = ANativeWindow_getHeight(g_active_window);
@@ -484,6 +492,7 @@ HLE64_NAMED("d3d9.dll", "IDirect3D9::GetAdapterDisplayMode", d3d9_GetAdapterDisp
             mode->Format = D3DFMT_X8R8G8B8;
         }
 #if defined(ANDROID) || defined(__ANDROID__)
+        std::lock_guard<std::mutex> window_lock(g_android_window_mutex);
         if (g_active_window) {
             int32_t w = ANativeWindow_getWidth(g_active_window);
             int32_t h = ANativeWindow_getHeight(g_active_window);
@@ -629,10 +638,15 @@ HLE64_NAMED("d3d9.dll", "IDirect3D9::CreateDevice", d3d9_CreateDevice, 7) {
     if (Rd32(0x141E09F04ull) == 0) {
         Wr32(0x141E09F04ull, 0x3F800000u);
     }
+    if (Rd32(0x141E0A218ull) == 0) {
+        WarnF("[*] d3d9: GSystemSettings.ScreenPercentage (0x141E0A218) was 0.0f; setting to 100.0f");
+        Wr32(0x141E0A218ull, 0x42C80000u);
+    }
 
     D3DPRESENT_PARAMETERS* pp = reinterpret_cast<D3DPRESENT_PARAMETERS*>(GPtr(pPresentationParameters));
     if (pp) {
 #if defined(ANDROID) || defined(__ANDROID__)
+        std::lock_guard<std::mutex> window_lock(g_android_window_mutex);
         if (g_active_window) {
             pp->hDeviceWindow = (HWND)g_active_window;
         }
@@ -649,7 +663,7 @@ HLE64_NAMED("d3d9.dll", "IDirect3D9::CreateDevice", d3d9_CreateDevice, 7) {
             Adapter,
             DeviceType,
 #if defined(ANDROID) || defined(__ANDROID__)
-            (HWND)g_active_window,
+            pp->hDeviceWindow,
 #else
             pp->hDeviceWindow,
 #endif
@@ -793,6 +807,7 @@ HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::Reset", dev9_Reset, 2) {
             host_pp.BackBufferHeight = 720;
         }
 #if defined(ANDROID) || defined(__ANDROID__)
+        std::lock_guard<std::mutex> window_lock(g_android_window_mutex);
         if (g_active_window) {
             host_pp.hDeviceWindow = (HWND)g_active_window;
         }
@@ -820,6 +835,14 @@ HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::Present", dev9_Present, 5) {
             }
             Wr32(0x141E09F08ull, 0x3F800000u);
             Wr32(0x141E09F04ull, 0x3F800000u);
+        }
+        if (Rd32(0x141E0A218ull) == 0) {
+            static bool s_loggedSp100Reset = false;
+            if (!s_loggedSp100Reset) {
+                s_loggedSp100Reset = true;
+                WarnF("[*] d3d9::Present: 0x141E0A218 (ScreenPercentage) reset to 0.0f! Restoring 100.0f (frame %u)", g_d3d9PresentCount);
+            }
+            Wr32(0x141E0A218ull, 0x42C80000u);
         }
         const RECT* src = Arg(c, 1) ? reinterpret_cast<const RECT*>(GPtr(Arg(c, 1))) : nullptr;
         const RECT* dst = Arg(c, 2) ? reinterpret_cast<const RECT*>(GPtr(Arg(c, 2))) : nullptr;
@@ -1321,7 +1344,16 @@ HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::MultiplyTransform", dev9_MultiplyTran
 HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::SetViewport", dev9_SetViewport, 2) {
     auto dev = com::As<D3DDevice9Host>(Arg(c, 0));
     if (dev && dev->host_device && Arg(c, 1)) {
-        return dev->host_device->SetViewport(reinterpret_cast<const D3DVIEWPORT9*>(GPtr(Arg(c, 1))));
+        auto* viewport = reinterpret_cast<const D3DVIEWPORT9*>(GPtr(Arg(c, 1)));
+        static std::atomic<unsigned> small_logs{0}, normal_logs{0};
+        bool small = viewport->Width <= 1 || viewport->Height <= 1;
+        auto& count = small ? small_logs : normal_logs;
+        if (count.load(std::memory_order_relaxed) < 8 &&
+            count.fetch_add(1, std::memory_order_relaxed) < 8) {
+            WarnF("[render] SetViewport x=%u y=%u width=%u height=%u",
+                  viewport->X, viewport->Y, viewport->Width, viewport->Height);
+        }
+        return dev->host_device->SetViewport(viewport);
     }
     return D3D_OK;
 }
@@ -1631,7 +1663,9 @@ HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::GetVertexDeclaration", dev9_GetVertex
 
 HLE64_NAMED("d3d9.dll", "IDirect3DDevice9::SetFVF", dev9_SetFVF, 2) {
     auto dev = com::As<D3DDevice9Host>(Arg(c, 0));
-    if (dev && dev->host_device) return dev->host_device->SetFVF((DWORD)Arg(c, 1));
+    if (dev && dev->host_device) {
+        return dev->host_device->SetFVF((DWORD)Arg(c, 1));
+    }
     return D3D_OK;
 }
 
